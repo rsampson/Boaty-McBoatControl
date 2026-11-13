@@ -202,7 +202,31 @@ Do these once, on the bench, in this order.
   speed, left and right spin the boat on the spot.
 - Wait for a GPS fix before you set off, so the boat records where home is. The
   Nav page shows `Home+` when it has.
-- Moving the joystick always takes back control from the autopilot.
+- Moving the joystick takes back control from the autopilot (except during a
+  recall, below).
+
+### Recall: getting the boat back
+
+**Hold both buttons together for one second**, on any page. The display shows
+`RECALL` in large letters on every page: blinking until the boat confirms it has
+the order, then steady. Hold both buttons again to withdraw it and return to
+manual control.
+
+A recall overrides everything else. The boat comes home from manual driving, a
+route, the self-test or a compass calibration, and **the joystick does not
+cancel it**, so a knocked stick cannot interrupt the retrieval. The order is
+sent in every packet while it is on, so it gets through on a poor link and stays
+in force if the link drops.
+
+| The boat's situation | What a recall does |
+|---|---|
+| Home point set, GPS fix, compass good | Returns home and stops there. |
+| Compass missing, faulty or not calibrated | Returns home steering by its GPS course. This is slower and less direct: the boat moves off straight ahead first, then curves toward home. The Nav page shows `Why: recall, by GPS`. |
+| No GPS fix | Motors stop. It sets off as soon as a fix arrives. |
+| No home point recorded | Motors stop. Nothing can be done until the boat has had a GPS fix. |
+
+The Nav page says which of these applies. A recall cannot help if the battery is
+exhausted or a motor has failed.
 
 ## 7. The controller display
 
@@ -212,12 +236,12 @@ backwards, except on the Nav and Setup pages where it works the menus.
 | Page | Shows |
 |---|---|
 | 1 Link | `LINK OK` or `NO LINK`; percentage of packets acknowledged and received, with a bar; signal strength at each end in dBm (nearer 0 is stronger); boat and controller battery voltage; the motor commands being sent. |
-| 2 GPS | Fix state, satellites, latitude and longitude, speed and course, and the boat's distance and bearing from home. If the link drops, the last known position stays on screen. |
+| 2 GPS | Fix state, satellites, the boat's compass heading as a figure and as a needle in a small compass ring (straight up is north), latitude and longitude, speed and course, and the boat's distance and bearing from home. If the link drops, the last known position stays on screen. |
 | 3 Nav | The boat's mode in large letters, progress, a readiness line, and the command menu. |
 | 4 Setup | Settings you can change. |
 | 5 Trip | Distance travelled, top speed, motor running time and lowest battery voltage since the boat was switched on. |
 | 6 Test | Self-test progress and results. |
-| 7 Info | Addresses, radio channel and reminders of the button actions. |
+| 7 Info | Addresses; the chip temperature reading and transmit power at each end; radio channel and firmware protocol version. |
 
 ### Nav page
 
@@ -234,7 +258,9 @@ The readiness line reads, for example, `GPS+ Cmp+ Home+ Rte-`:
 | Rte | Waypoints loaded and accepted | `-` none, or one is too far from home |
 
 **Menu.** A short press of SELECT moves the `>` marker. **Hold SELECT for one
-second** to send the choice; the marker turns to `*` briefly.
+second** to send the choice; the marker turns to `*` briefly. With no link the
+choice is refused and the marker shows `x`: commands are never saved up for
+later.
 
 | Choice | Effect |
 |---|---|
@@ -309,6 +335,7 @@ obstacles, the bank or other water users, and keep it in sight.
 | Radio link lost for half a second, in manual | Motors stop. |
 | Radio link lost for 3 seconds | The boat returns home and stops there. |
 | Link comes back while returning | It keeps returning until you move the joystick. |
+| Recall given from the controller | The boat returns home from any state; only withdrawing the recall ends it (section 6). |
 | Battery below the `LowBatt home` setting for 10 seconds | The boat returns home. |
 | Driven past the geofence | The boat returns home. If you take back control while still outside, the fence is ignored until the boat is back inside. |
 | End of a route | The boat returns home. |
@@ -316,8 +343,28 @@ obstacles, the bank or other water users, and keep it in sight.
 
 When the boat is coming home by its own decision, the Nav page says why.
 
+The boat only steers itself with a **calibrated compass**. Without one it stops
+its motors and drifts instead of returning, so calibrate before the first outing.
+
 All of these need a recorded home point, which needs a GPS fix with at least six
 satellites. **With no home point the boat can only stop its motors.**
+
+### Transmit power
+
+Each radio uses only as much power as the other end needs to hear it well, and
+goes back to full power the moment the link looks doubtful or is lost. At close
+range both ends drop to their minimum (2 dBm); full power is 19.5 dBm. This
+keeps the boards cooler and saves a little battery. The Info page shows the
+power in use at each end.
+
+If a chip's temperature reading passes `TEMP_LIMIT_C`, its power is capped until
+it cools. The sensor is uncalibrated and reads high (about 70 at room
+temperature on the boards used here), so the default limit of 85 is a starting
+point: note what the Info page reads when a board is as warm as you are happy
+with, and set the limit in that board's `config.h`.
+
+To switch all of this off and transmit at full power always, set
+`TX_POWER_AUTO` to `false` and `TEMP_LIMIT_C` to `0` in both `config.h` files.
 
 ## 10. Lights and beeps
 
@@ -329,15 +376,20 @@ satellites. **With no home point the boat can only stop its motors.**
 | Double beep every 2 seconds | Fewer than half the packets are getting through. |
 | One low beep every 5 seconds | Boat or controller battery low. |
 
-**Boat LED** (the ESP32's on-board LED):
+**On-board LED** (both boards). It is a heartbeat: it blinks only while the
+firmware is running, and the number of flashes in each beat tells you which
+firmware is on the board.
 
 | Pattern | Meaning |
 |---|---|
-| Steady | Linked to the controller. |
-| Slow blink | No signal. |
-| Quick blink | Under autopilot. |
+| **One** short flash per beat | Boat firmware. |
+| **Two** short flashes per beat | Controller firmware. |
+| A beat every second | Linked to the other unit. |
+| A beat every three seconds | Running, but not linked. |
+| Continuous quick blinking (boat) | Under autopilot. |
 | Very fast flicker | Radio failed to start. |
-| One-second blink | Firmware update mode. |
+| Even one-second on, one-second off | Firmware update mode. |
+| Dark or steadily lit | The firmware is not running. |
 
 ## 11. Updating firmware over WiFi
 
@@ -408,7 +460,7 @@ list is at the top of `console.ino` in each firmware folder.
 | Motors do nothing | Battery below 6.5 V at the drivers; wiring to IN1/IN2; no link. |
 | A motor runs backwards | Set its `MOTOR_INVERT_` option. |
 | Boat creeps with the stick centred | Controller was switched on with the stick off-centre. Switch it off and on again. |
-| `STICK CAL? re-power` on the display | Same cause; or a joystick wire is off. |
+| `STICK FAULT: restart` on the display, and the boat will not move | The joystick was off-centre at switch-on, or a joystick wire is off. The controller sends no motor commands until it is restarted with the stick centred. |
 | Battery voltage reads wrong | Resistor values differ from `config.h`; adjust `BATT_CAL`. The PC tool's interactive mode works out the value. |
 | `GPS-` for a long time | A first fix can take several minutes outdoors and may never come indoors. |
 | `Cmp-` | Compass wiring, or SDA and SCL swapped. |

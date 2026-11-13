@@ -12,6 +12,9 @@
 // highlighted choice to the boat (manual / run route / return home / set home /
 // calibrate compass / run self-test).
 //
+// RECALL: hold BOTH buttons for one second, on any page, to order the boat home
+// whatever it is doing. Hold both again to withdraw the order.
+//
 // On the Setup page a short press of SELECT moves down the list and a 1 second
 // hold starts editing. While editing, NEXT is plus and SELECT is minus; hold
 // SELECT to save, or hold NEXT to cancel.
@@ -97,8 +100,17 @@ static Button buttonSelect = {PIN_BUTTON_SELECT, false, false, 0};
 // acts each time the sequence number changes.
 static volatile uint8_t txCommand = CMD_NONE;
 static volatile uint8_t txCommandSeq = 0;
+// Recall is a standing order, not a command: it is sent in every packet while
+// it is on, so a single packet getting through is enough, and it is exempt from
+// the "never queue a command" rule (it can only ever bring the boat home).
+static volatile bool recallActive = false;
+
 static volatile uint8_t txParamId = PARAM_NONE;     // used with CMD_SET_PARAM
 static volatile int16_t txParamValue = 0;
+// A command is dropped if the boat has not had the chance to hear it within this
+// time, so nothing sent near the edge of range can take effect minutes later.
+static const uint32_t COMMAND_LIFETIME_MS = 2000;
+static uint32_t txCommandSetMs = 0;
 
 // Controller-side setting (kept in this board's flash) and its own battery.
 static volatile uint8_t speedLimitPct = 100;        // caps joystick power
@@ -111,17 +123,25 @@ struct SetupItem {
   int16_t minValue, maxValue, step;
 };
 
+// The one definition of "the boat is being heard". Call with stateMux held.
+static bool telemetryFresh(uint32_t now) {
+  return telemetrySeen && now - telemetryAtMs < LINK_TIMEOUT_MS;
+}
+
 // ---- Radio callbacks (run in the WiFi task: keep them short) ----------------
 
 static void onSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  uint32_t now = millis();
+  portENTER_CRITICAL(&stateMux);    // controlTask reads and clears these counters
   sendAttempts = sendAttempts + 1;
   txTotal = txTotal + 1;
   if (status == ESP_NOW_SEND_SUCCESS) {
     sendAcked = sendAcked + 1;
     ackTotal = ackTotal + 1;
-    lastAckMs = millis();
+    lastAckMs = now;
     everAcked = true;
   }
+  portEXIT_CRITICAL(&stateMux);
 }
 
 static void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -211,6 +231,11 @@ static void controlTask(void *) {
     pkt.magic   = MAGIC_CONTROL;
     pkt.version = PROTO_VERSION;
     pkt.seq     = seq++;
+    // The stick was not at rest when its centre was measured (held over, or a
+    // wire is off), so its readings cannot be trusted: command nothing at all
+    // until the controller is restarted with the stick centred.
+    if (centreSuspect) left = right = 0.0f;
+
     float limit = speedLimitPct / 100.0f;
     pkt.left    = (int16_t)lroundf(left * limit * CMD_MAX);
     pkt.right   = (int16_t)lroundf(right * limit * CMD_MAX);
@@ -218,11 +243,17 @@ static void controlTask(void *) {
     pkt.commandSeq = txCommandSeq;
     pkt.paramId    = txParamId;
     pkt.paramValue = txParamValue;
+    // Tell the boat how well we hear it, so it can set its own transmit power.
+    uint32_t now = millis();
+    portENTER_CRITICAL(&stateMux);
+    pkt.rssi = telemetryFresh(now) ? telemetryRssi : 0;
+    pkt.flags = recallActive ? CTRL_FLAG_RECALL : 0;
+    portEXIT_CRITICAL(&stateMux);
     cmdLeft  = pkt.left;
     cmdRight = pkt.right;
     // Full rate while the boat is answering; otherwise only every Nth cycle.
     // The first acknowledgement brings the full rate straight back.
-    bool searching = !everAcked || millis() - lastAckMs > SEARCH_AFTER_MS;
+    bool searching = !everAcked || now - lastAckMs > SEARCH_AFTER_MS;
     if (!searching || pkt.seq % (CONTROL_RATE_HZ / SEARCH_RATE_HZ) == 0) {
       esp_now_send(BOAT_MAC, (const uint8_t *)&pkt, sizeof(pkt));
     }
@@ -237,9 +268,11 @@ static void controlTask(void *) {
       controllerBatteryMv = controllerBatteryMv ? (uint16_t)(controllerBatteryMv + 0.3f * (mv - controllerBatteryMv))
                                                 : (uint16_t)mv;
 #endif
+      portENTER_CRITICAL(&stateMux);
       uint32_t attempts = sendAttempts, acked = sendAcked;
       sendAttempts = 0;
       sendAcked = 0;
+      portEXIT_CRITICAL(&stateMux);
       ackPercent = attempts ? (uint8_t)min<uint32_t>(100, acked * 100 / attempts) : 0;
     }
 
@@ -249,19 +282,28 @@ static void controlTask(void *) {
 
 // ---- Display -----------------------------------------------------------------
 
+static bool recallConfirmed = false;   // the boat's telemetry shows it has the recall order
+
 static Status readStatus() {
   Status st;
+  uint32_t now = millis();
   portENTER_CRITICAL(&stateMux);
   st.t = telemetry;
   st.rssiHere = telemetryRssi;
   st.seen = telemetrySeen;
-  st.linked = telemetrySeen && (millis() - telemetryAtMs < LINK_TIMEOUT_MS);
+  st.linked = telemetryFresh(now);
   portEXIT_CRITICAL(&stateMux);
   st.ackPct = ackPercent;
   return st;
 }
 
 static void drawHeader(const char *title, bool blink) {
+  // A recall takes over the headline of every page. It blinks until the boat
+  // confirms it has the order (set by loop() in recallConfirmed).
+  if (recallActive) {
+    title = "RECALL";
+    blink = !recallConfirmed;
+  }
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(2);
@@ -318,7 +360,7 @@ static void drawLinkPage(const Status &st) {
   // What we are commanding.
   display.setCursor(0, 57);
   if (centreSuspect && blinkOn) {
-    display.print("STICK CAL? re-power");
+    display.print("STICK FAULT: restart");
   } else {
     display.printf("L%+5d  R%+5d", cmdLeft, cmdRight);
   }
@@ -343,9 +385,23 @@ static void drawGpsPage(const Status &st) {
 
   display.setCursor(0, 18);
   if (st.linked) {
-    display.printf("Satellites %u", t.sats);
+    display.printf("Sats %u", t.sats);
   } else {
-    display.print("Satellites --");
+    display.print("Sats --");
+  }
+
+  // Compass at the right: a ring with a north mark, and a needle pointing the
+  // way the bow points (straight up = north). The figure is beside it.
+  bool haveHeading = st.seen && t.headingDeci != 0xFFFF;
+  display.setCursor(54, 18);
+  if (haveHeading) display.printf("Hdg %u", t.headingDeci / 10); else display.print("Hdg ---");
+  const int cx = 114, cy = 34, radius = 11;
+  display.drawCircle(cx, cy, radius, SSD1306_WHITE);
+  display.drawLine(cx, cy - radius, cx, cy - radius - 2, SSD1306_WHITE);   // north mark
+  if (haveHeading) {
+    float angle = t.headingDeci / 10.0f * DEG_TO_RAD;
+    display.drawLine(cx, cy, cx + (int)lroundf((radius - 2) * sinf(angle)),
+                     cy - (int)lroundf((radius - 2) * cosf(angle)), SSD1306_WHITE);
   }
 
   display.setCursor(0, 28);
@@ -378,12 +434,29 @@ static const uint8_t NAV_MENU_COMMAND[] = {CMD_MODE_MANUAL, CMD_MODE_ROUTE, CMD_
                                            CMD_SET_HOME, CMD_CALIBRATE_COMPASS, CMD_SELF_TEST};
 static const uint8_t NAV_MENU_COUNT = sizeof(NAV_MENU_COMMAND);
 static uint8_t  navMenuIndex = 0;
-static uint32_t navSentMs = 0;      // when a menu choice was last sent (0 = never)
+static uint32_t navMarkMs = 0;      // when a menu choice was last sent or refused (0 = never)
+static char     navMark = '*';      // '*' sent, 'x' refused for want of a link
 
-static void sendNavCommand(uint8_t command) {
+// The only way a command leaves the controller. Refuses (returns false) when
+// the boat is not linked: a command is never queued for a boat that cannot
+// hear it. loop() expires it after COMMAND_LIFETIME_MS.
+static bool queueCommand(bool boatLinked, uint8_t command, uint8_t paramId = PARAM_NONE,
+                         int16_t paramValue = 0) {
+  if (!boatLinked) return false;
+  txParamId = paramId;
+  txParamValue = paramValue;
   txCommand = command;              // command first, then the sequence number that announces it
   txCommandSeq = txCommandSeq + 1;
-  navSentMs = millis() | 1;
+  txCommandSetMs = millis();
+  return true;
+}
+
+// Returns whether the command was sent; either way the menu marker shows it.
+static bool sendNavCommand(bool boatLinked, uint8_t command) {
+  bool sent = queueCommand(boatLinked, command);
+  navMark = sent ? '*' : 'x';
+  navMarkMs = millis() | 1;
+  return sent;
 }
 
 static void drawNavPage(const Status &st) {
@@ -407,7 +480,10 @@ static void drawNavPage(const Status &st) {
   if (!st.linked) {
     display.print("Boat not heard");
   } else if ((t.flags & TELEM_FLAG_NAV_HOLD) && blinkOn) {
-    display.print("WAITING GPS/COMPASS");
+    // The autopilot wants to move but cannot: say what it is waiting for.
+    display.print(!(t.flags & TELEM_FLAG_HOME_SET) ? "NO HOME POINT YET"
+                  : !(t.flags & TELEM_FLAG_GPS_FIX) ? "WAITING FOR GPS FIX"
+                                                    : "WAITING FOR COMPASS");
   } else {
     if (t.mode == MODE_ROUTE) {
       display.printf("WP%u/%u %um ", t.waypoint, t.waypointCount, t.distanceM);
@@ -426,11 +502,12 @@ static void drawNavPage(const Status &st) {
   // Readiness: + ready, - not ready, ? compass present but not calibrated.
   // While the boat is coming home by its own decision, say why instead.
   static const char *const HOME_REASONS[] = {"", "", "signal was lost", "route finished",
-                                             "boat battery low", "geofence crossed"};
+                                             "boat battery low", "geofence crossed", "recall"};
   display.setCursor(0, 27);
   if (st.linked && t.mode == MODE_HOME && t.homeReason >= HOME_SIGNAL_LOST &&
-      t.homeReason <= HOME_GEOFENCE) {
-    display.printf("Why: %s", HOME_REASONS[t.homeReason]);
+      t.homeReason <= HOME_RECALL) {
+    display.printf("Why: %s%s", HOME_REASONS[t.homeReason],
+                   (t.flags2 & TELEM2_GPS_STEERING) ? ", by GPS" : "");
   } else if (st.linked) {
     char compass = !(t.flags & TELEM_FLAG_COMPASS_OK) ? '-'
                    : (t.flags & TELEM_FLAG_COMPASS_CAL) ? '+' : '?';
@@ -440,13 +517,15 @@ static void drawNavPage(const Status &st) {
   }
 
   // Menu: three lines, scrolled to keep the highlighted entry in view. The
-  // marker changes to '*' briefly after a choice has been sent.
-  bool justSent = navSentMs && millis() - navSentMs < 1500;
+  // marker changes to '*' briefly after a choice has been sent, or to 'x' if
+  // it was refused because the boat is not linked.
+  bool justMarked = navMarkMs && millis() - navMarkMs < 1500;
   int first = constrain((int)navMenuIndex - 1, 0, NAV_MENU_COUNT - 3);
   for (int row = 0; row < 3; row++) {
     int item = first + row;
     display.setCursor(0, 37 + row * 9);
-    display.print(item != navMenuIndex ? "  " : justSent ? "* " : "> ");
+    display.print(item != navMenuIndex ? ' ' : justMarked ? navMark : '>');
+    display.print(' ');
     display.print(NAV_MENU[item]);
   }
 }
@@ -514,7 +593,7 @@ static void setupStep(int direction) {
   setupValue = (int16_t)constrain(value, (int)item.minValue, (int)item.maxValue);
 }
 
-static void setupSave() {
+static void setupSave(bool boatLinked) {
   const SetupItem &item = SETUP_ITEMS[setupIndex];
   if (item.param == PARAM_NONE) {
     speedLimitPct = (uint8_t)setupValue;
@@ -524,11 +603,10 @@ static void setupSave() {
     prefs.end();
   } else {
     // The page shows the boat's own value from telemetry, so a successful save
-    // is confirmed when the new value appears there.
-    txParamId = item.param;
-    txParamValue = (item.param == PARAM_CRUISE) ? setupValue * 10 : setupValue;
-    txCommand = CMD_SET_PARAM;
-    txCommandSeq = txCommandSeq + 1;
+    // is confirmed when the new value appears there. If the link dropped
+    // mid-edit the change is discarded.
+    queueCommand(boatLinked, CMD_SET_PARAM, item.param,
+                 (item.param == PARAM_CRUISE) ? setupValue * 10 : setupValue);
   }
   setupEditing = false;
 }
@@ -615,19 +693,24 @@ static void drawTestPage(const Status &st) {
   display.printf("mV %u %u %u %u", t.testSagMv[0], t.testSagMv[1], t.testSagMv[2], t.testSagMv[3]);
 }
 
-static void drawInfoPage() {
+static void drawInfoPage(const Status &st) {
   drawHeader("INFO", false);
   display.setCursor(0, 18);
   display.print("Me   ");
   display.print(WiFi.macAddress().substring(6));    // last 3 bytes fit the line
   display.setCursor(0, 28);
   display.printf("Boat %02X:%02X:%02X:%02X", BOAT_MAC[2], BOAT_MAC[3], BOAT_MAC[4], BOAT_MAC[5]);
+  // Chip temperature (uncalibrated sensor) and transmit power at each end.
   display.setCursor(0, 38);
-  display.printf("Channel %d  proto v%d", RADIO_CHANNEL, PROTO_VERSION);
+  display.printf("Me   %3dC tx %2ddBm", (int)linkTempC, linkTxPowerQdbm / 4);
   display.setCursor(0, 48);
-  display.print("Nav: hold SEL = send");
+  if (st.linked) {
+    display.printf("Boat %3dC tx %2ddBm", st.t.tempC, st.t.txPowerDbm);
+  } else {
+    display.print("Boat  --C tx --dBm");
+  }
   display.setCursor(0, 57);
-  display.print("Hold BOOT 2s = update");
+  display.printf("Ch%d v%d BOOT 2s=update", RADIO_CHANNEL, PROTO_VERSION);
 }
 
 static void drawMessage(const char *line1, const char *line2, const char *line3 = "") {
@@ -682,6 +765,10 @@ static void beep(uint16_t hz) {   // 0 = silent
 static void updateBeeper(const Status &st) {
   static uint32_t ackBadSinceMs = 0, battLowSinceMs = 0;
   uint32_t now = millis();
+  if (!st.seen) {         // the rule above, for every condition below
+    beep(0);
+    return;
+  }
 
   bool ackBad = st.linked && st.ackPct < BEEP_ACK_CRITICAL_PCT;
   if (!ackBad) ackBadSinceMs = 0; else if (!ackBadSinceMs) ackBadSinceMs = now | 1;
@@ -694,7 +781,7 @@ static void updateBeeper(const Status &st) {
   if (!battLow) battLowSinceMs = 0; else if (!battLowSinceMs) battLowSinceMs = now | 1;
 
   uint16_t hz = 0;
-  if (st.seen && !st.linked) {
+  if (!st.linked) {
     if (now % 300 < 100) hz = 2700;                           // link lost: fast beeps
   } else if (ackBadSinceMs && now - ackBadSinceMs > 1000) {
     uint32_t phase = now % 2000;                              // link critical: double beep
@@ -736,6 +823,7 @@ static void runOtaMode() {
   bool released = false;   // ignore the press that got us here
   for (;;) {
     ArduinoOTA.handle();
+    digitalWrite(PIN_STATUS_LED, (millis() / 1000) % 2);   // slow blink
     bool down = digitalRead(PIN_OTA_BUTTON) == LOW;
     if (!down) released = true;
     if (down && released) ESP.restart();
@@ -753,6 +841,7 @@ void setup() {
   pinMode(PIN_BUTTON_SELECT, INPUT_PULLUP);
   txCommandSeq = (uint8_t)esp_random();   // so a restarted controller's commands still look new
   pinMode(PIN_OTA_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_STATUS_LED, OUTPUT);
   pinMode(PIN_BEEPER, OUTPUT);
   digitalWrite(PIN_BEEPER, LOW);
 
@@ -805,21 +894,46 @@ void loop() {
   checkOtaButton();
   consolePoll();
   if (!radioOk) {
+    digitalWrite(PIN_STATUS_LED, (millis() / 100) % 2);   // fast flicker: radio fault
     delay(10);
     return;
   }
 
   bool redraw = false;
   Status st = readStatus();
+  // Heartbeat: two flashes per beat marks this as the controller.
+  heartbeatLed(PIN_STATUS_LED, HEARTBEAT_FLASHES_CONTROLLER, st.linked);
+  recallConfirmed = st.linked && (st.t.flags2 & TELEM2_RECALL);
+
   Press next = poll(buttonNext);
   Press select = poll(buttonSelect);
+
+  // Both buttons held for a second: toggle the recall. While both are down
+  // neither button's own press is acted on, now or when they are released.
+  static uint32_t chordSinceMs = 0;
+  static bool chordFired = false;
+  if (buttonNext.down && buttonSelect.down) {
+    next = select = PRESS_NONE;
+    buttonNext.longFired = buttonSelect.longFired = true;
+    if (!chordSinceMs) {
+      chordSinceMs = millis() | 1;
+    } else if (!chordFired && millis() - chordSinceMs >= 1000) {
+      chordFired = true;
+      recallActive = !recallActive;
+      setupEditing = false;
+      redraw = true;
+    }
+  } else {
+    chordSinceMs = 0;
+    chordFired = false;
+  }
   if (next != PRESS_NONE || select != PRESS_NONE) redraw = true;
 
   if (page == PAGE_SETUP && setupEditing) {
     // Editing a setting: NEXT is plus, SELECT is minus; hold SELECT to save, hold NEXT to cancel.
     if (next == PRESS_SHORT) setupStep(+1);
     else if (select == PRESS_SHORT) setupStep(-1);
-    else if (select == PRESS_LONG) setupSave();
+    else if (select == PRESS_LONG) setupSave(st.linked);
     else if (next == PRESS_LONG) setupEditing = false;
   } else {
     if (next == PRESS_SHORT) page = (page + 1) % PAGE_COUNT;
@@ -827,8 +941,8 @@ void loop() {
       if (select == PRESS_SHORT) {
         navMenuIndex = (navMenuIndex + 1) % NAV_MENU_COUNT;
       } else if (select == PRESS_LONG) {
-        sendNavCommand(NAV_MENU_COMMAND[navMenuIndex]);
-        if (NAV_MENU_COMMAND[navMenuIndex] == CMD_SELF_TEST) page = PAGE_TEST;   // watch it run
+        bool sent = sendNavCommand(st.linked, NAV_MENU_COMMAND[navMenuIndex]);
+        if (sent && NAV_MENU_COMMAND[navMenuIndex] == CMD_SELF_TEST) page = PAGE_TEST;   // watch it run
       }
     } else if (page == PAGE_SETUP) {
       if (select == PRESS_SHORT) setupIndex = (setupIndex + 1) % SETUP_COUNT;
@@ -837,6 +951,17 @@ void loop() {
       page = (page + PAGE_COUNT - 1) % PAGE_COUNT;
     }
   }
+
+  // Transmit power, once a second: only as much as the boat needs to hear us well.
+  static uint32_t powerTickMs = 0;
+  if (millis() - powerTickMs >= 1000) {
+    powerTickMs = millis();
+    linkPowerUpdate(st.linked && st.ackPct >= LINK_HEALTHY_PCT, st.t.rssi);
+  }
+
+  // Expire a command the boat has had long enough to hear. The sequence number
+  // is left alone, so a boat that missed it sees only "no command".
+  if (txCommand != CMD_NONE && millis() - txCommandSetMs > COMMAND_LIFETIME_MS) txCommand = CMD_NONE;
 
   updateBeeper(st);
 
@@ -848,7 +973,7 @@ void loop() {
       case PAGE_SETUP: drawSetupPage(st); break;
       case PAGE_TRIP: drawTripPage(st); break;
       case PAGE_TEST: drawTestPage(st); break;
-      case PAGE_INFO: drawInfoPage();  break;
+      case PAGE_INFO: drawInfoPage(st);  break;
       default:        drawLinkPage(st); break;
     }
     display.display();

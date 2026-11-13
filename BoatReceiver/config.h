@@ -30,7 +30,7 @@ static const uint8_t CONTROLLER_MAC[6] = {0xF0, 0x24, 0xF9, 0x43, 0x49, 0x74};
 #define PIN_COMPASS_SDA    21
 #define PIN_COMPASS_SCL    22
 
-#define PIN_STATUS_LED     2      // on-board LED: solid = linked, blinking = no signal
+#define PIN_STATUS_LED     2      // on-board LED: heartbeat, one flash per beat
 #define PIN_OTA_BUTTON     0      // BOOT button: hold 2 s to enter firmware-update mode
 
 // ---- Firmware update over WiFi (OTA) ----------------------------------------
@@ -75,6 +75,7 @@ static const uint8_t CONTROLLER_MAC[6] = {0xF0, 0x24, 0xF9, 0x43, 0x49, 0x74};
 #define RTH_DELAY_MS         3000    // signal lost this long: return to the home point
 #define NAV_SLOW_RADIUS_M    15.0f   // autopilot eases off inside this distance of its target
 #define NAV_SLOW_MIN_PERCENT 40      // ...down to this share of cruise power at the target
+#define NAV_GPS_COURSE_MIN_CM_S 50   // recall with no compass: GPS course is trusted above this speed
 
 // ---- Settings changeable from the controller's Setup page ---------------------
 // These are only the values used until a setting is first changed; after that
@@ -103,3 +104,16 @@ struct Waypoint {
 };
 static const Waypoint WAYPOINTS[] = {
 };
+
+// ---- Transmit power --------------------------------------------------------
+// With TX_POWER_AUTO the radio uses only as much power as keeps the other end
+// hearing it between these two signal strengths, and returns to full power the
+// moment the link looks doubtful. Set it to false to stay at full power.
+#define TX_POWER_AUTO        true
+#define TX_RSSI_STRONG_DBM   -60     // heard stronger than this: reduce power
+#define TX_RSSI_WEAK_DBM     -75     // heard weaker than this: increase power
+
+// Above this reading from the chip's temperature sensor, transmit power is
+// capped to let it cool. The sensor is uncalibrated and reads high (about 70 on
+// the bench): watch the Info page and set this to suit your board. 0 disables.
+#define TEMP_LIMIT_C         85

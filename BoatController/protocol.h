@@ -10,7 +10,7 @@
 #include <esp_wifi.h>
 #include <esp_now.h>
 
-#define PROTO_VERSION      5
+#define PROTO_VERSION      7
 #define RADIO_CHANNEL      1      // 1..13, must be the same on both ends
 #define CONTROL_RATE_HZ    50     // controller -> boat
 #define TELEMETRY_RATE_HZ  5      // boat -> controller
@@ -93,6 +93,19 @@ enum : uint8_t {
   HOME_ROUTE_DONE,
   HOME_LOW_BATTERY,
   HOME_GEOFENCE,
+  HOME_RECALL,                    // the operator's recall is in force
+};
+
+// ControlPacket.flags: standing orders. Unlike commands these are state, sent in
+// every packet for as long as they apply.
+enum : uint8_t {
+  CTRL_FLAG_RECALL = 0x01,        // come home now, whatever else is going on
+};
+
+// TelemetryPacket.flags2
+enum : uint8_t {
+  TELEM2_RECALL       = 0x01,     // the boat has the recall order
+  TELEM2_GPS_STEERING = 0x02,     // steering by GPS course because the compass is unusable
 };
 
 struct __attribute__((packed)) ControlPacket {
@@ -105,6 +118,8 @@ struct __attribute__((packed)) ControlPacket {
   uint8_t  commandSeq;            // changes when `command` is a new request
   uint8_t  paramId;               // PARAM_*, used with CMD_SET_PARAM
   int16_t  paramValue;
+  int8_t   rssi;                  // how strongly the controller hears the boat, dBm (0 = not heard)
+  uint8_t  flags;                 // CTRL_FLAG_*
 };
 
 struct __attribute__((packed)) TelemetryPacket {
@@ -138,6 +153,9 @@ struct __attribute__((packed)) TelemetryPacket {
   uint16_t tripTopSpeedCmS;
   uint16_t tripMotorSec;          // time with the motors running
   uint16_t tripMinBatteryMv;
+  int8_t   tempC;                 // boat chip temperature sensor (uncalibrated)
+  int8_t   txPowerDbm;            // boat transmit power now
+  uint8_t  flags2;                // TELEM2_*
 };
 
 // Bring up WiFi in Espressif Long Range mode and register the one peer we talk to.
@@ -173,4 +191,73 @@ static inline bool linkBegin(const uint8_t peerMac[6]) {
 
   #undef LINK_TRY
   return true;
+}
+
+// ---- Transmit power control ---------------------------------------------------
+// Both ends run the same rule once a second. Each is told how strongly the other
+// end hears it, and uses no more power than keeps that comfortably strong. Any
+// sign of trouble puts it straight back to full power. Separately, a hot chip
+// lowers the ceiling. Settings (TX_POWER_AUTO, TX_RSSI_*, TEMP_LIMIT_C) are in
+// each sketch's config.h, which must be included before this file.
+//
+// Power is in the radio's units of 0.25 dBm.
+
+#define TX_POWER_MAX_QDBM      78     // 19.5 dBm
+#define TX_POWER_MIN_QDBM      8      // 2 dBm
+#define TX_POWER_WARM_QDBM     56     // 14 dBm ceiling at the temperature limit
+#define TX_POWER_HOT_QDBM      44     // 11 dBm ceiling TEMP_HYSTERESIS_C above it
+#define TX_STEP_DOWN_QDBM      8      // ease down 2 dB at a time
+#define TX_STEP_UP_QDBM        16     // come up 4 dB at a time: faster than down
+#define TEMP_HYSTERESIS_C      5      // so the temperature ceiling does not chatter
+#define LINK_HEALTHY_PCT       90     // share of packets that must get through to allow reduced power
+
+static int8_t linkTxPowerQdbm = TX_POWER_MAX_QDBM;      // what the radio is set to now
+static int8_t linkThermalCapQdbm = TX_POWER_MAX_QDBM;   // ceiling imposed by temperature
+static float  linkTempC = 0;                            // the sensor reading the ceiling was set from
+
+// linkHealthy : the link is up and at least LINK_HEALTHY_PCT of packets are getting through
+// peerRssiDbm : how strongly the other end hears us (0 = unknown)
+static inline void linkPowerUpdate(bool linkHealthy, int peerRssiDbm) {
+  // The one place the temperature sensor is sampled; displays and telemetry
+  // show linkTempC, so they show the figure the ceiling acted on.
+  linkTempC = temperatureRead();
+  if (TEMP_LIMIT_C > 0) {
+    if (linkTempC >= TEMP_LIMIT_C + TEMP_HYSTERESIS_C) {
+      linkThermalCapQdbm = TX_POWER_HOT_QDBM;
+    } else if (linkTempC >= TEMP_LIMIT_C) {
+      if (linkThermalCapQdbm > TX_POWER_WARM_QDBM) linkThermalCapQdbm = TX_POWER_WARM_QDBM;
+    } else if (linkTempC < TEMP_LIMIT_C - TEMP_HYSTERESIS_C) {
+      linkThermalCapQdbm = TX_POWER_MAX_QDBM;
+    }
+  }
+
+  int want = linkTxPowerQdbm;
+  if (!TX_POWER_AUTO || !linkHealthy || peerRssiDbm == 0) {
+    want = TX_POWER_MAX_QDBM;                 // off, or any doubt about the link: full power
+  } else if (peerRssiDbm > TX_RSSI_STRONG_DBM) {
+    want -= TX_STEP_DOWN_QDBM;                // heard very well: ease down
+  } else if (peerRssiDbm < TX_RSSI_WEAK_DBM) {
+    want += TX_STEP_UP_QDBM;                  // getting weak: come up
+  }
+  want = constrain(want, TX_POWER_MIN_QDBM, (int)linkThermalCapQdbm);
+
+  if (want != linkTxPowerQdbm) {
+    linkTxPowerQdbm = (int8_t)want;
+    esp_wifi_set_max_tx_power(linkTxPowerQdbm);
+  }
+}
+
+// ---- Heartbeat LED ---------------------------------------------------------------
+// Call every pass of loop(): if the code stops running, so does the blinking.
+// The number of flashes in each beat says which firmware is on the board, so a
+// bare ESP32 can be identified by eye. Beats come once a second when the two
+// ends are linked and once every three seconds when they are not.
+
+#define HEARTBEAT_FLASHES_BOAT        1
+#define HEARTBEAT_FLASHES_CONTROLLER  2
+
+static inline void heartbeatLed(uint8_t pin, uint8_t flashes, bool linked) {
+  uint32_t t = millis() % (linked ? 1000u : 3000u);
+  // Each flash is 80 ms on, and flashes within a beat start 250 ms apart.
+  digitalWrite(pin, t < flashes * 250u && t % 250u < 80u);
 }

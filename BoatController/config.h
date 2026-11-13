@@ -24,6 +24,7 @@ static const uint8_t BOAT_MAC[6] = {0xF8, 0xB3, 0xB7, 0x4F, 0x56, 0xD8};
 #define PIN_OTA_BUTTON     0      // BOOT button: hold 2 s to enter firmware-update mode
 
 #define PIN_BEEPER         25     // piezo between this pin and GND
+#define PIN_STATUS_LED     2      // on-board LED: heartbeat, two flashes per beat
 
 // ---- Joystick --------------------------------------------------------------
 // The stick centre is measured at power-up, so leave the stick alone then.
@@ -61,3 +62,16 @@ static const uint8_t BOAT_MAC[6] = {0xF8, 0xB3, 0xB7, 0x4F, 0x56, 0xD8};
 // Join it and upload to 192.168.4.1.
 #define OTA_AP_NAME        "Controller-OTA"
 #define OTA_AP_PASSWORD    "boatyboat"   // at least 8 characters; change it
+
+// ---- Transmit power --------------------------------------------------------
+// With TX_POWER_AUTO the radio uses only as much power as keeps the other end
+// hearing it between these two signal strengths, and returns to full power the
+// moment the link looks doubtful. Set it to false to stay at full power.
+#define TX_POWER_AUTO        true
+#define TX_RSSI_STRONG_DBM   -60     // heard stronger than this: reduce power
+#define TX_RSSI_WEAK_DBM     -75     // heard weaker than this: increase power
+
+// Above this reading from the chip's temperature sensor, transmit power is
+// capped to let it cool. The sensor is uncalibrated and reads high (about 70 on
+// the bench): watch the Info page and set this to suit your board. 0 disables.
+#define TEMP_LIMIT_C         85

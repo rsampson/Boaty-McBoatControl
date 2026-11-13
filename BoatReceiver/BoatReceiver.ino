@@ -13,6 +13,10 @@
 // its battery runs low, or if it strays beyond the geofence (when those are set).
 // Moving the joystick takes back manual control from either autopilot mode.
 //
+// Recall (both controller buttons held) is a standing order that overrides all
+// of the above: the boat comes home from any mode, the joystick does not cancel
+// it, and with no usable compass it steers by GPS course instead of stopping.
+//
 // Holding the BOOT button for 2 seconds restarts into firmware-update (OTA)
 // mode; see config.h.
 //
@@ -61,6 +65,8 @@ static uint8_t  rxCommand = CMD_NONE;
 static uint8_t  rxCommandSeq = 0;
 static uint8_t  rxParamId = PARAM_NONE;
 static int16_t  rxParamValue = 0;
+static int8_t   rxPeerRssi = 0;              // how strongly the controller hears us (0 = unknown)
+static uint8_t  rxFlags = 0;                 // CTRL_FLAG_* from the latest packet; kept if the link drops
 static uint8_t  cmdParamId = PARAM_NONE;     // loop()'s copy of the two above
 static int16_t  cmdParamValue = 0;
 static uint8_t  strangerMac[6];
@@ -90,6 +96,8 @@ static void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int 
   rxCommandSeq = pkt.commandSeq;
   rxParamId = pkt.paramId;
   rxParamValue = pkt.paramValue;
+  rxPeerRssi = pkt.rssi;
+  rxFlags = pkt.flags;
   portEXIT_CRITICAL(&stateMux);
 }
 
@@ -298,6 +306,12 @@ static bool compassOk() {
   return compassChip != COMPASS_NONE && compassEverRead && millis() - compassReadMs < 1000;
 }
 
+// Good enough to steer by. An uncalibrated compass can be wrong by tens of
+// degrees, so every autopilot decision asks this, not compassOk().
+static bool compassUsable() {
+  return compassOk() && compassCalibrated;
+}
+
 static bool i2cProbe(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
@@ -490,6 +504,8 @@ static float   navDistanceM = 0;
 static uint8_t homeReason = HOME_NONE;      // why we are in MODE_HOME
 static float   homeDistanceM = 0;           // how far the boat is from home
 static float   bearingFromHomeDeg = 0;      // which way the boat lies, seen from home
+static bool    recallActive = false;        // the operator's recall order is in force
+static bool    gpsSteering = false;         // steering by GPS course (recall, compass unusable)
 
 static int32_t waypointLatE7(uint8_t i) { return (int32_t)lround(WAYPOINTS[i].lat * 1e7); }
 static int32_t waypointLonE7(uint8_t i) { return (int32_t)lround(WAYPOINTS[i].lon * 1e7); }
@@ -535,6 +551,9 @@ static void selfTestStart();
 static void selfTestAbort(const char *why);
 
 static void handleCommand(uint8_t command, bool stickAtRest) {
+  // Under recall nothing may change what the boat is doing; settings and the
+  // home point can still be adjusted.
+  if (recallActive && command != CMD_SET_PARAM && command != CMD_SET_HOME) return;
   if (mode == MODE_SELFTEST) selfTestAbort("new command from controller");
   switch (command) {
     case CMD_SELF_TEST:
@@ -548,7 +567,7 @@ static void handleCommand(uint8_t command, bool stickAtRest) {
       if (mode != MODE_CALIBRATING) enterMode(MODE_MANUAL);
       break;
     case CMD_MODE_ROUTE:
-      if (mode != MODE_CALIBRATING && homeSet && routeOk && gpsHasFix() && compassOk()) {
+      if (mode != MODE_CALIBRATING && homeSet && routeOk && gpsHasFix() && compassUsable()) {
         enterMode(MODE_ROUTE);
       }
       break;
@@ -574,6 +593,7 @@ static void handleCommand(uint8_t command, bool stickAtRest) {
 static void navUpdate() {
   navLeft = navRight = 0;
   navHold = false;
+  gpsSteering = false;
   bool canNavigate = homeSet && gpsHasFix();
   float distance = 0, bearing = 0;
   if (canNavigate) {
@@ -587,8 +607,13 @@ static void navUpdate() {
     return;
   }
 
-  if (!canNavigate || !compassOk()) {
-    navHold = true;       // motors stay off until GPS and compass are back
+  // Driving at cruise power on a heading that cannot be trusted is worse than
+  // drifting, so an unusable compass holds the boat just as a lost fix does.
+  // The one exception is a recall: the operator has asked for the boat back by
+  // any means, so it steers by GPS course instead (see below).
+  bool steerByGps = !compassUsable() && mode == MODE_HOME && homeReason == HOME_RECALL;
+  if (!canNavigate || (!compassUsable() && !steerByGps)) {
+    navHold = true;       // motors stay off until GPS and compass are usable
     return;
   }
 
@@ -597,10 +622,7 @@ static void navUpdate() {
                        waypointLonE7(waypointIndex), distance, bearing);
     if (distance < NAV_ARRIVE_RADIUS_M) {
       waypointIndex++;
-      if (waypointIndex >= WAYPOINT_COUNT) {                    // route finished: go home
-        mode = MODE_HOME;
-        homeReason = HOME_ROUTE_DONE;
-      }
+      if (waypointIndex >= WAYPOINT_COUNT) goHome(HOME_ROUTE_DONE);   // route finished
       return;             // steer for the new target on the next pass
     }
   } else {
@@ -617,7 +639,24 @@ static void navUpdate() {
   if (distance < NAV_SLOW_RADIUS_M) {
     cruise = max(cruise * NAV_SLOW_MIN_PERCENT / 100, (int)(cruise * distance / NAV_SLOW_RADIUS_M));
   }
-  navSteer(navWrap180(bearing - headingDeg), cruise, NAV_PIVOT_POWER, NAV_PIVOT_DEG, CMD_MAX,
+  if (!steerByGps) {
+    navSteer(navWrap180(bearing - headingDeg), cruise, NAV_PIVOT_POWER, NAV_PIVOT_DEG, CMD_MAX,
+             navLeft, navRight);
+    return;
+  }
+
+  // GPS-course steering. GPS only knows which way the boat is travelling, and
+  // only while it is moving, so:
+  //  - too slow for a trustworthy course: drive straight ahead to get one;
+  //  - otherwise turn toward home in an arc, never on the spot (a pivot would
+  //    stop the boat and lose the course). A pivot limit of 180 degrees makes
+  //    navSteer always arc.
+  gpsSteering = true;
+  if (gps.speedCmS < NAV_GPS_COURSE_MIN_CM_S) {
+    navLeft = navRight = cruise;
+    return;
+  }
+  navSteer(navWrap180(bearing - gps.courseDeci / 10.0f), cruise, NAV_PIVOT_POWER, 180.0f, CMD_MAX,
            navLeft, navRight);
 }
 
@@ -773,7 +812,7 @@ void loop() {
   uint32_t commandAge, rxTotal;
   int8_t rssi;
   bool seen, stranger;
-  uint8_t strangerCopy[6], command, commandSeq;
+  uint8_t strangerCopy[6], command, commandSeq, controlFlags;
   portENTER_CRITICAL(&stateMux);
   wantLeft = targetLeft;
   wantRight = targetRight;
@@ -786,6 +825,7 @@ void loop() {
   cmdParamId = rxParamId;
   cmdParamValue = rxParamValue;
   stranger = strangerSeen;
+  controlFlags = rxFlags;
   memcpy(strangerCopy, strangerMac, 6);
   portEXIT_CRITICAL(&stateMux);
 
@@ -807,10 +847,27 @@ void loop() {
     }
   }
 
+  // Recall: a standing order carried in every control packet. It is taken
+  // from the latest packet heard, so it stays in force if the link then drops.
+  // It overrides every mode, and ends only when the controller withdraws it.
+  recallActive = seen && (controlFlags & CTRL_FLAG_RECALL);
+  bool recalled = (mode == MODE_HOME && homeReason == HOME_RECALL);
+  if (recallActive && !recalled) {
+    Serial.println("Recall: returning home");
+    if (mode == MODE_SELFTEST) selfTestAbort("recall");
+    calibrating = false;
+    benchActive = false;
+    goHome(HOME_RECALL);
+  } else if (!recallActive && recalled) {
+    Serial.println("Recall withdrawn: manual control");
+    enterMode(MODE_MANUAL);
+  }
+
   // Joystick override: moving the stick takes back manual control. The stick
   // must first be seen at rest, so a stick held over while the link dropped
   // cannot cancel the return home the moment the link comes back.
-  if (!linkLost && (mode == MODE_ROUTE || mode == MODE_HOME)) {
+  // A recall is not overridden this way: only withdrawing it ends it.
+  if (!linkLost && !recallActive && (mode == MODE_ROUTE || mode == MODE_HOME)) {
     int stick = max(abs(wantLeft), abs(wantRight));
     if (stick == 0) {
       overrideArmed = true;
@@ -923,6 +980,9 @@ void loop() {
     rxPerSec = (uint8_t)min<uint32_t>(255, rxTotal - rxCountAtLastSecond);
     rxCountAtLastSecond = rxTotal;
 
+    // Transmit power: only as much as the controller needs to hear us well.
+    linkPowerUpdate(!linkLost && rxPerSec >= CONTROL_RATE_HZ * LINK_HEALTHY_PCT / 100, rxPeerRssi);
+
     // Trip statistics. GPS speed jitters by a few tenths of a m/s at rest, so
     // only count it when the boat is clearly moving.
     if (gpsHasFix() && gps.speedCmS > 30) {
@@ -1005,11 +1065,18 @@ void loop() {
     pkt.tripTopSpeedCmS = tripTopSpeedCmS;
     pkt.tripMotorSec = tripMotorSec;
     pkt.tripMinBatteryMv = tripMinBatteryMv;
+    pkt.tempC = (int8_t)constrain(linkTempC, -128.0f, 127.0f);
+    pkt.txPowerDbm = linkTxPowerQdbm / 4;
+    pkt.flags2 = (recallActive ? TELEM2_RECALL : 0) | (gpsSteering ? TELEM2_GPS_STEERING : 0);
     esp_now_send(CONTROLLER_MAC, (const uint8_t *)&pkt, sizeof(pkt));
     telemetrySent++;
   }
 
-  // LED: solid = linked, slow blink = no signal, quick double-rate blink = autopilot.
-  bool autopilot = (mode == MODE_ROUTE || mode == MODE_HOME);
-  digitalWrite(PIN_STATUS_LED, autopilot ? (now / 150) % 2 : linkLost ? (now / 500) % 2 : HIGH);
+  // LED: rapid blink under autopilot; otherwise the heartbeat (one flash per
+  // beat marks this as the boat; beats are slower with no signal).
+  if (mode == MODE_ROUTE || mode == MODE_HOME) {
+    digitalWrite(PIN_STATUS_LED, (now / 150) % 2);
+  } else {
+    heartbeatLed(PIN_STATUS_LED, HEARTBEAT_FLASHES_BOAT, !linkLost);
+  }
 }

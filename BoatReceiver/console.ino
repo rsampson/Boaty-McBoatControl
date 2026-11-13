@@ -50,6 +50,7 @@ static void consoleId() {
   Serial.printf("heap_free=%u\n", (unsigned)ESP.getFreeHeap());
   Serial.printf("heap_min=%u\n", (unsigned)ESP.getMinFreeHeap());
   Serial.printf("uptime_ms=%lu\n", (unsigned long)millis());
+  Serial.printf("temp_c=%.1f\n", temperatureRead());
 }
 
 static void consoleGps() {
@@ -87,6 +88,9 @@ static void consoleStatus() {
   Serial.printf("rx_total=%lu\n", (unsigned long)rxCount);
   Serial.printf("telemetry_sent=%lu\n", (unsigned long)telemetrySent);
   Serial.printf("rssi=%d\n", lastRssi);
+  Serial.printf("peer_rssi=%d\n", rxPeerRssi);
+  Serial.printf("tx_power_dbm=%.1f\n", linkTxPowerQdbm / 4.0f);
+  Serial.printf("tx_power_cap_dbm=%.1f\n", linkThermalCapQdbm / 4.0f);
   Serial.printf("battery_mv=%.0f\n", batteryMv);
   Serial.printf("gps_present=%d\n", gpsPresent());
   Serial.printf("gps_fix=%d\n", gpsHasFix());
@@ -96,6 +100,9 @@ static void consoleStatus() {
   Serial.printf("route_ok=%d\n", routeOk);
   Serial.printf("waypoints=%u\n", WAYPOINT_COUNT);
   Serial.printf("home_reason=%u\n", homeReason);
+  Serial.printf("recall=%d\n", recallActive);
+  Serial.printf("nav_hold=%d\n", navHold);
+  Serial.printf("gps_steering=%d\n", gpsSteering);
   Serial.printf("set_trim=%d\n", setTrim);
   Serial.printf("set_cruise=%u\n", setCruise);
   Serial.printf("set_low_battery_mv=%u\n", setLowBatteryMv);
@@ -109,16 +116,28 @@ static void consoleStatus() {
   Serial.printf("test_sag_mv=%u,%u,%u,%u\n", testSagMv[0], testSagMv[1], testSagMv[2], testSagMv[3]);
 }
 
-static void consoleI2c() {
-  Serial.print("found=");
-  bool first = true;
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    if (i2cProbe(addr)) {
-      Serial.printf("%s0x%02x", first ? "" : ",", addr);
-      first = false;
-    }
+// The I2C scan probes one address per pass of loop(). A stuck bus makes every
+// probe wait for its timeout; done all at once that would hold up motor control
+// and the failsafe for seconds.
+static uint8_t i2cScanAddr = 0;      // next address to probe; 0 = no scan running
+static char    i2cFound[128];
+static uint8_t i2cFoundLen = 0;
+
+static void consoleI2cStart() {
+  i2cScanAddr = 1;
+  i2cFoundLen = 0;
+  i2cFound[0] = 0;
+}
+
+static void consoleI2cStep() {
+  if (i2cProbe(i2cScanAddr) && i2cFoundLen < sizeof(i2cFound) - 6) {
+    i2cFoundLen += snprintf(i2cFound + i2cFoundLen, sizeof(i2cFound) - i2cFoundLen, "%s0x%02x",
+                            i2cFoundLen ? "," : "", i2cScanAddr);
   }
-  Serial.println();
+  if (++i2cScanAddr >= 127) {
+    i2cScanAddr = 0;
+    Serial.printf("found=%s\nOK\n", i2cFound);
+  }
 }
 
 // Returns nullptr on success, or the reason for refusal.
@@ -153,7 +172,8 @@ static void consoleRun(char *line) {
   } else if (!strcmp(command, "status")) {
     consoleStatus();
   } else if (!strcmp(command, "i2c")) {
-    consoleI2c();
+    consoleI2cStart();
+    return;                          // the reply is sent when the scan finishes
   } else if (!strcmp(command, "compass")) {
     consoleCompass();
   } else if (!strcmp(command, "gps")) {
@@ -192,6 +212,10 @@ static void consoleRun(char *line) {
 void consolePoll() {
   static char line[64];
   static uint8_t len = 0;
+  if (i2cScanAddr) {                 // a scan is running: one probe, and no new commands yet
+    consoleI2cStep();
+    return;
+  }
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\r') continue;

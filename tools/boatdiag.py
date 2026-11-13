@@ -21,7 +21,13 @@ import serial
 from serial.tools import list_ports
 
 KEY_VALUE = re.compile(r"^([a-z0-9_]+)=(.*)$")
+# USB vendor IDs of the serial chips found on ESP32 boards: Silicon Labs CP210x,
+# WCH CH340/CH9102, FTDI, and Espressif's own. Auto-detection opens only these,
+# so it never disturbs an unrelated device such as a printer or modem.
+ESP_USB_VENDORS = {0x10C4, 0x1A86, 0x0403, 0x303A}
 ZERO_MAC = "00:00:00:00:00:00"
+TX_POWER_FULL_DBM = 19.5    # the radio's maximum; anything lower means power control or a heat cap is acting
+CLOSE_RANGE_DBM = -55       # both ends hear each other this strongly: power should come down
 
 
 class DiagError(Exception):
@@ -134,6 +140,8 @@ def check_common(board, report):
     report.add("info", "Firmware", f"built {info.get('build', '?')}, protocol v{info.get('proto', '?')}, "
                f"channel {info.get('channel', '?')}")
     report.add("info", "MAC address", f"{info.get('mac', '?')} (this board)")
+    if "temp_c" in info:
+        report.add("info", "Chip temperature sensor", f"{num(info, 'temp_c'):.0f} C (uncalibrated)")
 
     reason = info.get("reset_reason", "unknown")
     bad_resets = {"crash", "interrupt_watchdog", "task_watchdog", "watchdog", "brownout"}
@@ -163,7 +171,7 @@ def check_boat(board, report, args):
     check_common(board, report)
 
     # Compass
-    found = board.command("i2c").get("found", "")
+    found = board.command("i2c", timeout=6.0).get("found", "")
     report.add("info", "I2C devices", found or "none")
     compass = board.command("compass")
     if compass.get("chip") == "none":
@@ -401,12 +409,38 @@ def check_link(boat, controller, report, seconds):
     report.check(received / sent >= 0.95, "Control packets received by boat",
                  f"{received:.0f} of {sent:.0f} ({received / sent:.0%})")
     if telemetry_out:
+        telemetry_in = min(telemetry_in, telemetry_out)   # the two counters are read a moment apart
         report.check(telemetry_in / telemetry_out >= 0.90, "Telemetry received by controller",
                      f"{telemetry_in:.0f} of {telemetry_out:.0f}")
     else:
         report.add("fail", "Telemetry", "the boat sent none")
-    report.add("info", "Signal strength", f"{b1.get('rssi')} dBm at the boat, {c1.get('rssi_here')} dBm at the controller "
-               "(on the bench these should be strong, around -30 to -60)")
+    report.add("info", "Signal strength", f"{b1.get('rssi')} dBm at the boat, {c1.get('rssi_here')} dBm at the controller")
+
+    # Transmit power control: at close range both ends should have backed off from
+    # full power without losing packets. The link test above has usually given it
+    # time already; if not, wait a little for the first step down.
+    def reduced(c, b):
+        return num(b, "tx_power_dbm") < TX_POWER_FULL_DBM and num(c, "tx_power_dbm") < TX_POWER_FULL_DBM
+
+    close = num(b1, "rssi") > CLOSE_RANGE_DBM and num(c1, "rssi_here") > CLOSE_RANGE_DBM
+    deadline = time.monotonic() + 8
+    while close and not reduced(c1, b1) and time.monotonic() < deadline:
+        time.sleep(1)
+        c1, b1 = controller.command("status"), boat.command("status")
+    detail = (f"boat {num(b1, 'tx_power_dbm'):.1f} dBm, controller {num(c1, 'tx_power_dbm'):.1f} dBm "
+              f"(full power is {TX_POWER_FULL_DBM})")
+    # Once power has come down the received signal is weaker too, so "reduced"
+    # is judged first: it is proof the control is working whatever the range.
+    if reduced(c1, b1):
+        report.add("pass", "Transmit power control", detail)
+    elif close:
+        report.add("warn", "Transmit power control", detail + " - not reduced although the boards are close")
+    else:
+        report.add("info", "Transmit power control", detail + " - boards too far apart to expect a reduction")
+    for name, status in (("Boat", b1), ("Controller", c1)):
+        cap = num(status, "tx_power_cap_dbm", TX_POWER_FULL_DBM)
+        if cap < TX_POWER_FULL_DBM:
+            report.add("warn", f"{name} is hot", f"transmit power capped at {cap:.1f} dBm")
 
 
 # ---- Main ----------------------------------------------------------------------
@@ -420,10 +454,11 @@ def main():
     parser.add_argument("--link-seconds", type=float, default=10.0, help="length of the radio link test")
     args = parser.parse_args()
 
-    ports = args.port or [p.device for p in list_ports.comports() if p.vid is not None]
+    ports = args.port or [p.device for p in list_ports.comports() if p.vid in ESP_USB_VENDORS]
     if not ports:
-        print("No USB serial ports found. Plug a board in, or name one with --port.")
+        print("No ESP32-style USB serial ports found. Plug a board in, or name one with --port.")
         return 2
+    wait = 10.0 if args.port else 6.0   # a port you named gets longer to answer
 
     report = Report()
     boards = {}
@@ -433,7 +468,7 @@ def main():
         except serial.SerialException as error:
             print(f"{port}: cannot open ({error})")
             continue
-        if not board.identify():
+        if not board.identify(wait):
             print(f"{port}: no boat or controller firmware answered")
             continue
         if board.kind in boards:
@@ -445,18 +480,22 @@ def main():
         print("No boards answered.")
         return 2
 
-    try:
-        if "boat" in boards:
-            check_boat(boards["boat"], report, args)
-        if "controller" in boards:
-            check_controller(boards["controller"], report, args)
-        if len(boards) == 2:
-            check_link(boards["boat"], boards["controller"], report, args.link_seconds)
-        else:
-            missing = "controller" if "boat" in boards else "boat"
-            print(f"\n(Connect the {missing} as well to test the radio link.)")
-    except DiagError as error:
-        report.add("fail", "Diagnostics stopped", str(error))
+    def run(what, check, *check_args):
+        """One group of checks. A failure here must not stop the other groups."""
+        try:
+            check(*check_args)
+        except (DiagError, serial.SerialException) as error:
+            report.add("fail", f"{what} checks stopped", str(error))
+
+    if "boat" in boards:
+        run("Boat", check_boat, boards["boat"], report, args)
+    if "controller" in boards:
+        run("Controller", check_controller, boards["controller"], report, args)
+    if len(boards) == 2:
+        run("Link", check_link, boards["boat"], boards["controller"], report, args.link_seconds)
+    else:
+        missing = "controller" if "boat" in boards else "boat"
+        print(f"\n(Connect the {missing} as well to test the radio link.)")
     return report.summary()
 
 

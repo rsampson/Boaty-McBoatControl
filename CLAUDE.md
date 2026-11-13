@@ -78,7 +78,20 @@ arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyACM0 <sketch>
    something that runs alongside the link.
 9. **`display.begin()` returns true with no display attached.** The controller
    probes the I2C address first. Found by testing on hardware.
-10. **Never weaken a failsafe to make something else work.** See the mode rules
+10. **The controller never queues a command.** Menu commands and boat settings
+    are refused while unlinked, and `txCommand` expires after
+    `COMMAND_LIFETIME_MS`. A command that took effect when the link returned
+    could cancel a return home.
+11. **An untrusted joystick sends nothing.** If the power-up centre check fails
+    (`centreSuspect`), `controlTask` sends zero until restart. Full deflection
+    legitimately reads at the ADC rails, so a wire that comes off while running
+    cannot be told from a held stick; only the power-up check exists.
+12. **The autopilot requires a usable compass** (`compassUsable()`). Route is
+    refused and the return-home paths hold with motors off. Do not relax this to
+    "compass responding". The only exception is a recall (see the safety rules).
+13. **Nothing in `loop()` may block for long.** The boat's I2C scan is one probe
+    per pass for this reason.
+14. **Never weaken a failsafe to make something else work.** See the mode rules
     below; each one exists for a stated reason.
 
 ## Radio protocol (`protocol.h`)
@@ -95,6 +108,17 @@ arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyACM0 <sketch>
   baseline without acting, so a boat that restarts never replays an old command.
   The controller starts its sequence at a random value for the mirror-image
   reason. `CMD_SET_PARAM` carries `paramId` and `paramValue`.
+- **Transmit power control** (`linkPowerUpdate()` in `protocol.h`, run once a
+  second by both ends). Each end is told how strongly the other hears it (the
+  controller from telemetry `rssi`, the boat from `ControlPacket.rssi`) and
+  steps its power down 2 dB when that is above `TX_RSSI_STRONG_DBM`, up 4 dB
+  below `TX_RSSI_WEAK_DBM`. Lost link, poor delivery or unknown RSSI means full
+  power at once. `temperatureRead()` above `TEMP_LIMIT_C` lowers the ceiling.
+  The sensor is uncalibrated (about 70 at room temperature on these chips).
+  `protocol.h` uses these settings, so `config.h` must be included before it.
+- **Heartbeat LED** (`heartbeatLed()` in `protocol.h`): called from `loop()` on
+  both boards so that it stops if the code hangs. One flash per beat is the
+  boat, two is the controller; beats are 1 s apart when linked, 3 s when not.
 - Each end accepts packets only from its configured peer MAC, with the right
   length, magic byte and version.
 - Link quality on the display comes from three independent measurements:
@@ -126,11 +150,24 @@ All transitions go through `enterMode()` or `goHome(reason)`.
 - **Link lost for `RTH_DELAY_MS` (3 s) with a home point: `MODE_HOME`.** This
   latches. The boat keeps returning after the link comes back, so a boat at the
   edge of range does not flip between modes.
+- **Recall (`CTRL_FLAG_RECALL`) is a standing order, not a command.** The
+  controller sends it in every packet while it is on; the boat takes it from the
+  latest packet heard, so it stays in force through a link loss. It forces
+  `MODE_HOME` with `HOME_RECALL` from any mode (aborting self-test, calibration
+  and bench runs), blocks mode commands, and ends only when a packet arrives
+  without the flag. It is the deliberate exception to two other rules:
+  the stick override does not apply, and with an unusable compass the boat
+  steers by GPS course (`steerByGps` in `navUpdate()`) instead of holding. Being
+  state, it is also exempt from the controller's "never queue a command" rule;
+  that is safe only because it can do nothing but bring the boat home.
+- **GPS-course steering** is used for a recall only. GPS course exists only
+  while moving, so below `NAV_GPS_COURSE_MIN_CM_S` the boat drives straight to
+  get one, and it turns in arcs, never on the spot (pivot limit 180 degrees).
 - **Stick override.** In route or home mode, a joystick command above
   `NAV_STICK_OVERRIDE` returns to manual, but only after the stick has been seen
   at rest (`overrideArmed`). Without that, a stick held over when the link
   dropped would cancel the return home the moment the link returned.
-- **No fix or no compass under autopilot: motors off** (`navHold`), mode
+- **No fix, no compass, or an uncalibrated compass under autopilot: motors off** (`navHold`), mode
   unchanged, resumes when the sensors return.
 - **Route acceptance (`routeOk`).** Checked when the home point is set: at least
   one waypoint, and every waypoint within `NAV_MAX_RANGE_M` of home. This guards
@@ -211,12 +248,17 @@ battery are reported correctly.
 link in both directions (100% of control packets acknowledged, 99% counted by
 the boat, all telemetry received, about −35 dBm at each end); the controller's
 slow search rate with no boat (5 packets/s) and its return to 50 packets/s once
-the boat answers.
+the boat answers; transmit power control (both ends fell from 19.5 to 2 dBm at
+close range, received signal fell about 15 dB to match, no packets lost);
+the recall order given and withdrawn through the controller's console (boat
+entered and left `MODE_HOME`/`HOME_RECALL`; with no home point it held).
 
 **Verified on a PC:** the NMEA parser against standard sentences, and the
 navigation maths (distances, bearings, steering direction).
 
-**Never tested:** range beyond the bench; motors; GPS and compass hardware; the
+**Never tested:** GPS-course steering; the two-button recall gesture and the
+heartbeat LED patterns (not observed by anyone yet); range beyond the bench, including power control coming back
+up as the signal weakens; the temperature cap; motors; GPS and compass hardware; the
 display pages; buttons; beeper; OTA upload; compass calibration; the autopilot
 and every automatic return-home path; settings transfer from the Setup page.
 Treat all of these as unproven. Autopilot gains (`NAV_*`) are first guesses.

@@ -8,6 +8,7 @@
 //   buttons          the state of each button (1 = pressed)
 //   beep <hz> <ms>   sound the beeper (100..10000 Hz, at most 2000 ms)
 //   display          show a test pattern for 3 seconds
+//   recall <0|1>     withdraw or give the recall order (as holding both buttons does)
 
 static uint32_t consoleDisplayUntilMs = 0;
 static bool     consoleDisplayHeld = false;
@@ -49,6 +50,7 @@ static void consoleId() {
   Serial.printf("heap_free=%u\n", (unsigned)ESP.getFreeHeap());
   Serial.printf("heap_min=%u\n", (unsigned)ESP.getMinFreeHeap());
   Serial.printf("uptime_ms=%lu\n", (unsigned long)millis());
+  Serial.printf("temp_c=%.1f\n", temperatureRead());
 }
 
 static void consoleStatus() {
@@ -59,9 +61,12 @@ static void consoleStatus() {
   Serial.printf("ack_total=%lu\n", (unsigned long)ackTotal);
   Serial.printf("telemetry_total=%lu\n", (unsigned long)telemetryTotal);
   Serial.printf("rssi_here=%d\n", st.rssiHere);
+  Serial.printf("tx_power_dbm=%.1f\n", linkTxPowerQdbm / 4.0f);
+  Serial.printf("tx_power_cap_dbm=%.1f\n", linkThermalCapQdbm / 4.0f);
   Serial.printf("cmd_left=%d\n", cmdLeft);
   Serial.printf("cmd_right=%d\n", cmdRight);
   Serial.printf("page=%u\n", page);
+  Serial.printf("recall=%d\n", recallActive);
   Serial.printf("speed_limit_pct=%u\n", speedLimitPct);
   Serial.printf("battery_mv=%u\n", controllerBatteryMv);
   Serial.printf("battery_warn_mv=%d\n", CTRL_BATT_WARN_MV);
@@ -114,6 +119,10 @@ static void consoleRun(char *line) {
     } else {
       tone(PIN_BEEPER, hz, ms);
     }
+  } else if (!strcmp(command, "recall")) {
+    char *value = strtok(nullptr, " ");
+    if (!value || (value[0] != '0' && value[0] != '1')) error = "usage: recall <0|1>";
+    else recallActive = (value[0] == '1');
   } else if (!strcmp(command, "display")) {
     if (!displayOk) {
       error = "display not found";
