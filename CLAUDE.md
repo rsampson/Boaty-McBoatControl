@@ -268,7 +268,7 @@ Treat all of these as unproven. Autopilot gains (`NAV_*`) are first guesses.
 | Role | MAC | Set in |
 |---|---|---|
 | Boat | `F8:B3:B7:4F:56:D8` | `BOAT_MAC` in `BoatController/config.h` |
-| Controller | `F0:24:F9:43:49:74` | `CONTROLLER_MAC` in `BoatReceiver/config.h` |
+| Controller | `94:54:C5:F1:94:C0` | `CONTROLLER_MAC_BYTES` in `BoatReceiver/config.h` (compile-time override; earlier board was `F0:24:F9:43:49:74`) |
 
 Before flashing, read the attached board's MAC (`esptool read-mac`, or the
 tool's `id`) and flash the firmware that matches its role. Serial port names

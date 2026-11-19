@@ -19,8 +19,8 @@ static const uint8_t BOAT_MAC[6] = {0xF8, 0xB3, 0xB7, 0x4F, 0x56, 0xD8};
 #define OLED_I2C_ADDR      0x3C
 
 // Push buttons: wire each between its pin and GND (internal pull-ups are used).
-#define PIN_BUTTON_NEXT    32     // next display page
-#define PIN_BUTTON_SELECT  33     // previous page; on the Nav page: move / hold 1 s to choose
+#define PIN_BUTTON_NEXT    32     // moves down the page titles (Nav/Setup: moves the marker)
+#define PIN_BUTTON_SELECT  33     // opens the highlighted page; again to go back; Nav/Setup: hold 1 s to act
 #define PIN_OTA_BUTTON     0      // BOOT button: hold 2 s to enter firmware-update mode
 
 #define PIN_BEEPER         25     // piezo between this pin and GND

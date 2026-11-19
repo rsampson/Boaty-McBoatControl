@@ -343,6 +343,11 @@ def check_controller(board, report, args):
         report.check(my_mv >= num(status, "battery_warn_mv"), "Controller battery", f"{my_mv / 1000:.2f} V",
                      fail_level="warn")
     report.add("info", "Speed limit", f"{status.get('speed_limit_pct')}%")
+    if "open" in status:
+        names = ["Link", "GPS", "Nav", "Setup", "Trip", "Test", "Info"]
+        page = int(status.get("page", "0"))
+        name = names[page] if page < len(names) else f"page {page}"
+        report.add("info", "Screen", f"{name} page open" if status["open"] == "1" else f"title list, {name} highlighted")
     report.add("info", "Boat link", f"linked, {status.get('ack_pct')}% acknowledged"
                if status.get("linked") == "1" else "boat not heard")
 

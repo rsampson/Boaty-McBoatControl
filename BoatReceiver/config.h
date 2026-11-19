@@ -6,7 +6,13 @@
 // MAC address of the CONTROLLER's ESP32. The controller shows its own MAC on
 // its display and serial port at power-up. Copy it here. The boat obeys only
 // this address.
-static const uint8_t CONTROLLER_MAC[6] = {0xF0, 0x24, 0xF9, 0x43, 0x49, 0x74};
+// Compile-time option: override without editing this file by building with
+//   --build-property "compiler.cpp.extra_flags=-DCONTROLLER_MAC_BYTES=0xF0,0x24,0xF9,0x43,0x49,0x74"
+// The earlier controller board was F0:24:F9:43:49:74.
+#ifndef CONTROLLER_MAC_BYTES
+#define CONTROLLER_MAC_BYTES 0x94, 0x54, 0xC5, 0xF1, 0x94, 0xC0   // 94:54:C5:F1:94:C0
+#endif
+static const uint8_t CONTROLLER_MAC[6] = {CONTROLLER_MAC_BYTES};
 
 // ---- Pins ------------------------------------------------------------------
 // Two DRV8871 drivers, one per motor. Each has two inputs, IN1 and IN2.

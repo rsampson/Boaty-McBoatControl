@@ -7,17 +7,20 @@
 // navigation, setup, trip statistics, self-test results, and system information. A piezo beeper warns when the link is
 // failing or lost, or the boat battery is low.
 //
-// Buttons: NEXT steps through the pages. SELECT steps back, except on the Nav
-// page, where a short press moves along the menu and a 1 second hold sends the
+// Buttons: two levels. The top level is a list of page titles. NEXT steps down
+// the list (INFO wraps round to LINK) and SELECT opens the highlighted page. On
+// an opened page a short press of SELECT returns to the list.
+//
+// Nav page: NEXT moves along the menu and a 1 second hold of SELECT sends the
 // highlighted choice to the boat (manual / run route / return home / set home /
 // calibrate compass / run self-test).
 //
-// RECALL: hold BOTH buttons for one second, on any page, to order the boat home
-// whatever it is doing. Hold both again to withdraw the order.
+// Setup page: NEXT moves down the list and a 1 second hold of SELECT starts
+// editing. While editing, NEXT is plus and SELECT is minus; hold SELECT to save,
+// or hold NEXT to cancel.
 //
-// On the Setup page a short press of SELECT moves down the list and a 1 second
-// hold starts editing. While editing, NEXT is plus and SELECT is minus; hold
-// SELECT to save, or hold NEXT to cancel.
+// RECALL: hold BOTH buttons for one second, on any screen, to order the boat home
+// whatever it is doing. Hold both again to withdraw the order.
 //
 // Holding the BOOT button for 2 seconds restarts into firmware-update (OTA)
 // mode; see config.h.
@@ -74,7 +77,49 @@ static volatile int16_t  cmdRight = 0;
 // ---- Types (declared before any function so Arduino's prototypes can use them) ----
 
 enum Page : uint8_t { PAGE_LINK, PAGE_GPS, PAGE_NAV, PAGE_SETUP, PAGE_TRIP, PAGE_TEST, PAGE_INFO, PAGE_COUNT };
-static uint8_t page = PAGE_LINK;
+static uint8_t page = PAGE_LINK;      // the highlighted title, or the open page
+static bool    inDetails = false;     // false: the list of titles; true: `page` is open
+static uint8_t detailScroll = 0;      // where the user has scrolled to (0 whenever a page is opened)
+static uint8_t detailScrollMax = 0;   // last valid first row of what was drawn; NEXT wraps past it
+
+// The rows of an open page, in the large font: 10 characters across. A page
+// builds its rows, then drawRows() shows as many as fit and scrolls the rest.
+struct RowList {
+  static const uint8_t COLS = 10, MAX = 12;
+  char    text[MAX][COLS + 1];
+  uint8_t n = 0;
+  void add(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+    if (n >= MAX) return;
+    va_list args;
+    va_start(args, fmt);
+    int length = vsnprintf(text[n], COLS + 1, fmt, args);   // too long is cut off, never overflows
+    va_end(args);
+    if (length > COLS) text[n][COLS - 1] = '~';              // and marked, so a clipped value is not mistaken for a real one
+    n++;
+  }
+  // A label at the left and a value at the right edge.
+  void addPair(const char *label, const char *value) {
+    if (n >= MAX) return;
+    int pad = max(1, (int)COLS - (int)strlen(label) - (int)strlen(value));
+    int length = snprintf(text[n], COLS + 1, "%s%*s%s", label, pad, "", value);
+    if (length > COLS) text[n][COLS - 1] = '~';
+    n++;
+  }
+  // "Top 2.5m/s", or "Top 12m/s" once the decimal will not fit.
+  void addSpeed(const char *label, uint16_t cmPerSec) {
+    if (cmPerSec >= 1000) add("%s %um/s", label, cmPerSec / 100);
+    else add("%s %u.%um/s", label, cmPerSec / 100, (cmPerSec % 100) / 10);
+  }
+  // "Dist 850m", or "Dist 12km" from 10 km.
+  void addDistance(const char *label, uint32_t metres) {
+    if (metres >= 10000) add("%s %lukm", label, (unsigned long)(metres / 1000));
+    else add("%s %lum", label, (unsigned long)metres);
+  }
+  // A battery sag in millivolts; three digits is all there is room for.
+  void addSag(const char *label, uint16_t mv) {
+    if (mv > 999) add("%s >999", label); else add("%s %u", label, mv);
+  }
+};
 
 // One consistent copy of everything the display and beeper need.
 struct Status {
@@ -297,79 +342,148 @@ static Status readStatus() {
   return st;
 }
 
-static void drawHeader(const char *title, bool blink) {
-  // A recall takes over the headline of every page. It blinks until the boat
-  // confirms it has the order (set by loop() in recallConfirmed).
+// Clears the screen and draws the one-line banner in the large font, if there
+// is anything to say. A recall takes the banner of every page: blinking until
+// the boat confirms it has the order (set by loop() in recallConfirmed). Returns
+// the height used, so the page knows where its own content starts.
+static uint8_t drawBanner(const char *text, bool blink) {
   if (recallActive) {
-    title = "RECALL";
+    text = "RECALL";
     blink = !recallConfirmed;
   }
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-  if (!blink || (millis() / 400) % 2) display.print(title);
   display.setTextSize(1);
-  display.setCursor(110, 0);
-  display.printf("%d/%d", page + 1, PAGE_COUNT);
+  if (!text) return 0;
+  display.setTextSize(2);
+  display.setCursor(2, 0);
+  if (!blink || (millis() / 400) % 2) display.print(text);
+  display.setTextSize(1);
+  return 16;
+}
+
+// Draws the rows from y = top to the bottom of the screen, 16 pixels each, with
+// a thin scroll bar at the right edge when they do not all fit. `selected` is
+// the row to highlight (-1 for none); the view follows it. With none, NEXT
+// scrolls: loop() moves detailScroll on, wrapping past detailScrollMax.
+// `outline` draws the highlight as a frame instead of a filled bar.
+static void drawRows(const RowList &list, uint8_t top, int selected = -1, bool outline = false) {
+  const uint8_t visible = (64 - top) / 16;
+  const uint8_t maxFirst = list.n > visible ? list.n - visible : 0;
+  detailScrollMax = maxFirst;
+  // Where the user scrolled to is only changed by NEXT and, on a page with a
+  // selected row, by the selection moving. A banner appearing or going shrinks
+  // or grows the window but leaves that position alone.
+  uint8_t first = min<uint8_t>(detailScroll, maxFirst);
+  if (selected >= 0) {
+    if (selected < first) first = selected;
+    else if (selected >= first + visible) first = selected - visible + 1;
+    detailScroll = first;
+  }
+  const bool bar = list.n > visible;
+  const int width = bar ? 124 : 128;
+  display.setTextSize(2);
+  for (uint8_t row = 0; row < visible && first + row < list.n; row++) {
+    uint8_t i = first + row;
+    int y = top + row * 16;
+    bool hit = (i == selected);
+    bool filled = hit && !outline;
+    if (filled) display.fillRect(0, y, width, 16, SSD1306_WHITE);
+    if (hit && outline) display.drawRect(0, y, width, 16, SSD1306_WHITE);
+    display.setTextColor(filled ? SSD1306_BLACK : SSD1306_WHITE);
+    display.setCursor(2, y + 1);
+    display.print(list.text[i]);
+  }
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  if (bar) {
+    int h = 64 - top;
+    int thumb = max(4, h * visible / list.n);
+    display.drawFastVLine(127, top, h, SSD1306_WHITE);
+    display.fillRect(126, top + (h - thumb) * first / maxFirst, 2, thumb, SSD1306_WHITE);
+  }
+}
+
+// ---- Top level: the list of page titles ----
+
+static const char *const PAGE_TITLES[PAGE_COUNT] = {"LINK", "GPS", "NAV", "SETUP", "TRIP", "TEST", "INFO"};
+
+// Titles in the large font, as many as fit, scrolled so the highlighted one is
+// always shown. A recall takes the top row, blinking until the boat confirms it.
+static void drawTitleList() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  uint8_t rows = recallActive ? 3 : 4;
+  uint8_t top = (4 - rows) * 16;
+  if (recallActive) {
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    if (recallConfirmed || (millis() / 400) % 2) display.print("RECALL");
+  }
+  uint8_t first = constrain((int)page - (int)rows + 1, 0, PAGE_COUNT - rows);
+  for (uint8_t row = 0; row < rows; row++) {
+    uint8_t i = first + row;
+    bool selected = (i == page);
+    if (selected) display.fillRect(0, top + row * 16, 128, 16, SSD1306_WHITE);
+    display.setTextColor(selected ? SSD1306_BLACK : SSD1306_WHITE);
+    display.setCursor(4, top + row * 16 + 1);
+    display.print(PAGE_TITLES[i]);
+  }
+  display.setTextColor(SSD1306_WHITE);
 }
 
 static void drawLinkPage(const Status &st) {
   const TelemetryPacket &t = st.t;
   bool blinkOn = (millis() / 400) % 2;
 
-  drawHeader(st.linked ? "LINK OK" : "NO LINK", !st.linked);
+  uint8_t top = drawBanner(centreSuspect ? "BAD STICK" : !st.linked ? "NO LINK" : nullptr, true);
+  RowList rows;
+  if (centreSuspect) rows.add("Restart me");
 
   // Packets getting through: acknowledged by the boat / counted by the boat.
   int rxPct = st.linked ? min(100, t.rxPerSec * 100 / CONTROL_RATE_HZ) : 0;
-  display.setCursor(0, 18);
-  display.printf("Ack %3d%%   Rx %3d%%", st.ackPct, rxPct);
-
-  // Quality bar from the acknowledge rate.
-  display.drawRect(0, 28, 128, 6, SSD1306_WHITE);
-  display.fillRect(0, 28, 128 * st.ackPct / 100, 6, SSD1306_WHITE);
+  rows.add("Ack %3d%%", st.ackPct);
+  rows.add("Rx  %3d%%", rxPct);
 
   // Signal strength at each end (closer to 0 is stronger).
-  display.setCursor(0, 37);
   if (st.linked) {
-    display.printf("dBm boat%4d here%4d", t.rssi, st.rssiHere);
+    rows.add("Boat%4ddB", t.rssi);
+    rows.add("Here%4ddB", st.rssiHere);
   } else {
-    display.print("dBm boat --- here ---");
+    rows.add("Boat ---dB");
+    rows.add("Here ---dB");
   }
 
-  // Batteries: the boat's (last known value, marked "?", if the link drops)
-  // and this controller's. A low one blinks "LOW!".
-  display.setCursor(0, 47);
+  // Batteries: the boat's (last known value if the link drops: the banner says
+  // so) and this controller's. A low one blinks "LOW!".
   if (!st.seen) {
-    display.print("Boat -.--V");
+    rows.add("Bat -.--V");
   } else if (st.linked && BATT_WARN_MV > 0 && t.batteryMv < BATT_WARN_MV && blinkOn) {
-    display.print("Boat LOW! ");
+    rows.add("Bat LOW!");
   } else {
-    display.printf("Boat %u.%02uV%s", t.batteryMv / 1000, (t.batteryMv % 1000) / 10, st.linked ? "" : "?");
+    rows.add("Bat %u.%02uV", t.batteryMv / 1000, (t.batteryMv % 1000) / 10);
   }
   uint16_t myMv = controllerBatteryMv;
   if (myMv) {
-    display.setCursor(72, 47);
     if (CTRL_BATT_WARN_MV > 0 && myMv < CTRL_BATT_WARN_MV && blinkOn) {
-      display.print("Me LOW!");
+      rows.add("Me LOW!");
     } else {
-      display.printf("Me %u.%02uV", myMv / 1000, (myMv % 1000) / 10);
+      rows.add("Me %u.%02uV", myMv / 1000, (myMv % 1000) / 10);
     }
   }
 
   // What we are commanding.
-  display.setCursor(0, 57);
-  if (centreSuspect && blinkOn) {
-    display.print("STICK FAULT: restart");
-  } else {
-    display.printf("L%+5d  R%+5d", cmdLeft, cmdRight);
-  }
+  rows.add("L %+5d", cmdLeft);
+  rows.add("R %+5d", cmdRight);
+  drawRows(rows, top);
 }
 
-static void printDegrees(int32_t e7) {
+// A coordinate to five decimal places (about a metre), with a hemisphere letter
+// in place of a sign: "N51.12345", "W122.12345".
+static void addCoordinate(RowList &rows, int32_t e7, char positive, char negative) {
   uint32_t mag = (e7 < 0) ? (uint32_t)(-(int64_t)e7) : (uint32_t)e7;
-  display.printf("%c%lu.%07lu", e7 < 0 ? '-' : '+', (unsigned long)(mag / 10000000UL),
-                 (unsigned long)(mag % 10000000UL));
+  rows.add("%c%lu.%05lu", e7 < 0 ? negative : positive, (unsigned long)(mag / 10000000UL),
+           (unsigned long)((mag % 10000000UL) / 100));
 }
 
 static void drawGpsPage(const Status &st) {
@@ -377,59 +491,41 @@ static void drawGpsPage(const Status &st) {
   bool fix = st.linked && (t.flags & TELEM_FLAG_GPS_FIX);
   bool present = st.linked && (t.flags & TELEM_FLAG_GPS_PRESENT);
 
-  drawHeader(!st.linked ? "NO LINK" : fix ? "GPS FIX" : present ? "NO FIX" : "NO GPS", !fix);
+  uint8_t top = drawBanner(!st.linked ? "NO LINK" : nullptr, true);
+  RowList rows;
+  if (st.linked) rows.add(fix ? "GPS FIX" : present ? "NO FIX" : "NO GPS");
+
+  if (st.linked) rows.add("Sats %u", t.sats); else rows.add("Sats --");
+  bool haveHeading = st.seen && t.headingDeci != 0xFFFF;
+  if (haveHeading) rows.add("Hdg %u", t.headingDeci / 10); else rows.add("Hdg ---");
 
   // A position is worth showing even when stale: it is where the boat was last
-  // heard from. It is marked "last known" until it is current again.
+  // heard from. It is marked until it is current again.
   bool havePosition = st.seen && (t.latE7 != 0 || t.lonE7 != 0);
-
-  display.setCursor(0, 18);
-  if (st.linked) {
-    display.printf("Sats %u", t.sats);
+  if (havePosition) {
+    if (!fix) rows.add("last known");
+    addCoordinate(rows, t.latE7, 'N', 'S');
+    addCoordinate(rows, t.lonE7, 'E', 'W');
   } else {
-    display.print("Sats --");
+    rows.add("N ---");
+    rows.add("E ---");
   }
-
-  // Compass at the right: a ring with a north mark, and a needle pointing the
-  // way the bow points (straight up = north). The figure is beside it.
-  bool haveHeading = st.seen && t.headingDeci != 0xFFFF;
-  display.setCursor(54, 18);
-  if (haveHeading) display.printf("Hdg %u", t.headingDeci / 10); else display.print("Hdg ---");
-  const int cx = 114, cy = 34, radius = 11;
-  display.drawCircle(cx, cy, radius, SSD1306_WHITE);
-  display.drawLine(cx, cy - radius, cx, cy - radius - 2, SSD1306_WHITE);   // north mark
-  if (haveHeading) {
-    float angle = t.headingDeci / 10.0f * DEG_TO_RAD;
-    display.drawLine(cx, cy, cx + (int)lroundf((radius - 2) * sinf(angle)),
-                     cy - (int)lroundf((radius - 2) * cosf(angle)), SSD1306_WHITE);
-  }
-
-  display.setCursor(0, 28);
-  display.print("Lat ");
-  if (havePosition) printDegrees(t.latE7); else display.print("---");
-  display.setCursor(0, 38);
-  display.print("Lon ");
-  if (havePosition) printDegrees(t.lonE7); else display.print("---");
-
-  display.setCursor(0, 48);
   if (fix) {
-    display.printf("%u.%u m/s  %u deg", t.speedCmS / 100, (t.speedCmS % 100) / 10,
-                   t.courseDeci / 10);
-  } else if (havePosition) {
-    display.print("(last known position)");
+    rows.addSpeed("Spd", t.speedCmS);
+    rows.add("Crs %u", t.courseDeci / 10);
   }
 
   // Find my boat: where it is (or was last heard) relative to the home point.
-  display.setCursor(0, 57);
   if (st.seen && (t.flags & TELEM_FLAG_HOME_SET)) {
-    display.printf("From home %um @ %u", t.homeDistanceM, t.bearingFromHomeDeg);
+    rows.addDistance("Away", t.homeDistanceM);
+    rows.add("Brng %u", t.bearingFromHomeDeg);
   }
+  drawRows(rows, top);
 }
 
 // ---- Nav page: boat mode, progress, readiness, and the command menu ----
 
-static const char *const NAV_MENU[] = {"Manual control", "Run route", "Return home",
-                                       "Set home here", "Calibrate compass", "Run self-test"};
+static const char *const NAV_MENU[] = {"Manual", "Route", "Home", "Set home", "Calibrate", "Self-test"};
 static const uint8_t NAV_MENU_COMMAND[] = {CMD_MODE_MANUAL, CMD_MODE_ROUTE, CMD_MODE_HOME,
                                            CMD_SET_HOME, CMD_CALIBRATE_COMPASS, CMD_SELF_TEST};
 static const uint8_t NAV_MENU_COUNT = sizeof(NAV_MENU_COMMAND);
@@ -463,6 +559,11 @@ static void drawNavPage(const Status &st) {
   const TelemetryPacket &t = st.t;
   bool blinkOn = (millis() / 400) % 2;
 
+  // The mode and progress are the first small line; a recall takes the big
+  // banner above them.
+  uint8_t top = drawBanner(nullptr, false);
+  display.setTextWrap(false);       // a long status line is clipped, never spilled onto the menu
+
   const char *title = "NO LINK";
   if (st.linked) {
     switch (t.mode) {
@@ -473,41 +574,31 @@ static void drawNavPage(const Status &st) {
       default:               title = "MANUAL"; break;
     }
   }
-  drawHeader(title, !st.linked);
-
-  // Progress: where the boat is heading and how far it has to go.
-  display.setCursor(0, 18);
+  display.setCursor(0, top);
   if (!st.linked) {
-    display.print("Boat not heard");
+    if (blinkOn) display.print("NO LINK");
   } else if ((t.flags & TELEM_FLAG_NAV_HOLD) && blinkOn) {
     // The autopilot wants to move but cannot: say what it is waiting for.
     display.print(!(t.flags & TELEM_FLAG_HOME_SET) ? "NO HOME POINT YET"
                   : !(t.flags & TELEM_FLAG_GPS_FIX) ? "WAITING FOR GPS FIX"
                                                     : "WAITING FOR COMPASS");
   } else {
-    if (t.mode == MODE_ROUTE) {
-      display.printf("WP%u/%u %um ", t.waypoint, t.waypointCount, t.distanceM);
-    } else if (t.flags & TELEM_FLAG_HOME_SET) {
-      display.printf("Home %um ", t.distanceM);
-    } else {
-      display.print("No home yet ");
-    }
-    if (t.headingDeci == 0xFFFF) {
-      display.print("Hdg ---");
-    } else {
-      display.printf("Hdg %u", t.headingDeci / 10);
-    }
+    // Mode, how far there is to go, and the heading ("H---" if there is none).
+    display.print(title);
+    if (t.mode == MODE_ROUTE) display.printf(" %u/%u %um", t.waypoint, t.waypointCount, t.distanceM);
+    else if (t.flags & TELEM_FLAG_HOME_SET) display.printf(" %um", t.distanceM);
+    if (t.headingDeci == 0xFFFF) display.print(" H---"); else display.printf(" H%u", t.headingDeci / 10);
   }
 
   // Readiness: + ready, - not ready, ? compass present but not calibrated.
   // While the boat is coming home by its own decision, say why instead.
   static const char *const HOME_REASONS[] = {"", "", "signal was lost", "route finished",
                                              "boat battery low", "geofence crossed", "recall"};
-  display.setCursor(0, 27);
+  display.setCursor(0, top + 8);
   if (st.linked && t.mode == MODE_HOME && t.homeReason >= HOME_SIGNAL_LOST &&
       t.homeReason <= HOME_RECALL) {
     display.printf("Why: %s%s", HOME_REASONS[t.homeReason],
-                   (t.flags2 & TELEM2_GPS_STEERING) ? ", by GPS" : "");
+                   (t.flags2 & TELEM2_GPS_STEERING) ? ", GPS" : "");
   } else if (st.linked) {
     char compass = !(t.flags & TELEM_FLAG_COMPASS_OK) ? '-'
                    : (t.flags & TELEM_FLAG_COMPASS_CAL) ? '+' : '?';
@@ -516,28 +607,28 @@ static void drawNavPage(const Status &st) {
                    (t.flags & TELEM_FLAG_ROUTE_OK) ? '+' : '-');
   }
 
-  // Menu: three lines, scrolled to keep the highlighted entry in view. The
-  // marker changes to '*' briefly after a choice has been sent, or to 'x' if
-  // it was refused because the boat is not linked.
+  display.setTextWrap(true);
+
+  // Menu in the large font, scrolled to keep the highlighted entry in view. The
+  // first character is a space, or briefly '*' after a choice has been sent, or
+  // 'x' if it was refused because the boat is not linked.
   bool justMarked = navMarkMs && millis() - navMarkMs < 1500;
-  int first = constrain((int)navMenuIndex - 1, 0, NAV_MENU_COUNT - 3);
-  for (int row = 0; row < 3; row++) {
-    int item = first + row;
-    display.setCursor(0, 37 + row * 9);
-    display.print(item != navMenuIndex ? ' ' : justMarked ? navMark : '>');
-    display.print(' ');
-    display.print(NAV_MENU[item]);
+  RowList rows;
+  for (uint8_t item = 0; item < NAV_MENU_COUNT; item++) {
+    rows.add("%c%s", (item == navMenuIndex && justMarked) ? navMark : ' ', NAV_MENU[item]);
   }
+  drawRows(rows, top + 16, navMenuIndex);
 }
 
 // ---- Setup page: settings changed with the buttons ----
 
 static const SetupItem SETUP_ITEMS[] = {
-  {"Speed limit %", PARAM_NONE,           20,  100, 10},   // controller: caps joystick power
-  {"Trim L/R %",    PARAM_TRIM,          -30,   30,  1},   // + slows the right motor
-  {"Cruise %",      PARAM_CRUISE,         20,  100,  5},   // autopilot power
-  {"LowBatt home",  PARAM_LOW_BATTERY_MV,  0, 13000, 100}, // volts; off below 9.00
-  {"Geofence m",    PARAM_GEOFENCE_M,      0, 1000, 20},   // 0 = off
+  // Names are short: with the value they must fit 10 characters.
+  {"Speed",  PARAM_NONE,           20,  100, 10},   // % controller: caps joystick power
+  {"Trim",   PARAM_TRIM,          -30,   30,  1},   // % L/R, + slows the right motor
+  {"Cruise", PARAM_CRUISE,         20,  100,  5},   // % autopilot power
+  {"Batt",   PARAM_LOW_BATTERY_MV,  0, 13000, 100}, // return-home voltage; off below 9.00
+  {"Fence",  PARAM_GEOFENCE_M,      0, 1000, 20},   // metres, 0 = off
 };
 static const uint8_t SETUP_COUNT = sizeof(SETUP_ITEMS) / sizeof(SETUP_ITEMS[0]);
 static const int16_t LOW_BATTERY_LOWEST_MV = 9000;
@@ -556,25 +647,23 @@ static int16_t setupCurrent(uint8_t index, const Status &st) {
   }
 }
 
-static void setupPrintValue(uint8_t index, int16_t value) {
-  char text[8];
+static void setupFormatValue(uint8_t index, int16_t value, char *text, size_t size) {
   switch (SETUP_ITEMS[index].param) {
     case PARAM_TRIM:
-      snprintf(text, sizeof(text), "%+d", value);
+      snprintf(text, size, "%+d", value);
       break;
     case PARAM_LOW_BATTERY_MV:
-      if (value == 0) snprintf(text, sizeof(text), "off");
-      else snprintf(text, sizeof(text), "%d.%02dV", value / 1000, (value % 1000) / 10);
+      if (value == 0) snprintf(text, size, "off");
+      else snprintf(text, size, "%d.%02dV", value / 1000, (value % 1000) / 10);
       break;
     case PARAM_GEOFENCE_M:
-      if (value == 0) snprintf(text, sizeof(text), "off");
-      else snprintf(text, sizeof(text), "%d", value);
+      if (value == 0) snprintf(text, size, "off");
+      else snprintf(text, size, "%d", value);
       break;
     default:
-      snprintf(text, sizeof(text), "%d", value);
+      snprintf(text, size, "%d", value);
       break;
   }
-  display.printf("%6s", text);
 }
 
 // Boat settings can only be edited while the boat is there to receive them.
@@ -612,47 +701,39 @@ static void setupSave(bool boatLinked) {
 }
 
 static void drawSetupPage(const Status &st) {
-  drawHeader(setupEditing ? "EDIT" : "SETUP", false);
-  bool blinkOn = (millis() / 300) % 2;
+  uint8_t top = drawBanner(nullptr, false);
+  RowList rows;
   for (uint8_t i = 0; i < SETUP_COUNT; i++) {
-    bool selected = (i == setupIndex);
-    display.setCursor(0, 18 + i * 9);
-    display.print(!selected ? ' ' : !setupEditing ? '>' : blinkOn ? '#' : ' ');
-    display.printf("%-13s", SETUP_ITEMS[i].name);
-    if (selected && setupEditing) {
-      setupPrintValue(i, setupValue);
+    char value[8];
+    if (i == setupIndex && setupEditing) {
+      setupFormatValue(i, setupValue, value, sizeof(value));
     } else if (SETUP_ITEMS[i].param != PARAM_NONE && !st.seen) {
-      display.print("    --");            // boat setting, boat not heard yet
+      snprintf(value, sizeof(value), "--");            // boat setting, boat not heard yet
     } else {
-      setupPrintValue(i, setupCurrent(i, st));
+      setupFormatValue(i, setupCurrent(i, st), value, sizeof(value));
     }
+    rows.addPair(SETUP_ITEMS[i].name, value);
   }
+  // A filled bar marks the setting; while it is being edited, a frame instead.
+  drawRows(rows, top, setupIndex, setupEditing);
 }
 
 // ---- Trip page: statistics since the boat was switched on ----
 
 static void drawTripPage(const Status &st) {
   const TelemetryPacket &t = st.t;
-  drawHeader("TRIP", false);
+  uint8_t top = drawBanner(st.seen && !st.linked ? "NO LINK" : nullptr, true);
+  RowList rows;
   if (!st.seen) {
-    display.setCursor(0, 22);
-    display.print("Boat not heard yet.");
-    return;
+    rows.add("No boat");
+    rows.add("heard yet");
+  } else {
+    rows.addDistance("Dist", t.tripDistanceM);
+    rows.addSpeed("Top", t.tripTopSpeedCmS);
+    rows.add("Run %u:%02u", t.tripMotorSec / 60, t.tripMotorSec % 60);
+    if (t.tripMinBatteryMv) rows.add("Low %u.%02uV", t.tripMinBatteryMv / 1000, (t.tripMinBatteryMv % 1000) / 10);
   }
-  display.setCursor(0, 18);
-  display.printf("Distance   %5u m", t.tripDistanceM);
-  display.setCursor(0, 28);
-  display.printf("Top speed  %2u.%u m/s", t.tripTopSpeedCmS / 100, (t.tripTopSpeedCmS % 100) / 10);
-  display.setCursor(0, 38);
-  display.printf("Motor time %3u:%02u", t.tripMotorSec / 60, t.tripMotorSec % 60);
-  display.setCursor(0, 48);
-  if (t.tripMinBatteryMv) {
-    display.printf("Lowest batt %u.%02uV", t.tripMinBatteryMv / 1000, (t.tripMinBatteryMv % 1000) / 10);
-  }
-  if (!st.linked) {
-    display.setCursor(0, 57);
-    display.print("(last known values)");
-  }
+  drawRows(rows, top);
 }
 
 // ---- Test page: self-test progress and results ----
@@ -662,54 +743,56 @@ static void drawTestPage(const Status &st) {
   static const char *const STEP_TITLES[] = {"TEST", "L AHEAD", "L ASTERN", "R AHEAD",
                                             "R ASTERN", "DONE", "ABORTED"};
   bool running = st.linked && t.testStep >= TEST_LEFT_AHEAD && t.testStep <= TEST_RIGHT_ASTERN;
-  drawHeader(!st.linked ? "NO LINK" : STEP_TITLES[min<uint8_t>(t.testStep, TEST_ABORTED)],
-             !st.linked || running);
-
+  // The banner is the step in progress (blinking while it runs), or NO LINK.
+  uint8_t top = drawBanner(!st.linked ? "NO LINK"
+                           : t.testStep != TEST_IDLE ? STEP_TITLES[min<uint8_t>(t.testStep, TEST_ABORTED)]
+                                                     : nullptr,
+                           !st.linked || running);
+  RowList rows;
   if (!st.seen || !(t.testResults & TEST_RAN)) {
-    display.setCursor(0, 22);
-    display.print("No test run yet.");
-    display.setCursor(0, 36);
-    display.print("Nav page menu:");
-    display.setCursor(0, 46);
-    display.print("  Run self-test");
-    return;
+    rows.add("No test");
+    rows.add("run yet.");
+    rows.add("Nav menu:");
+    rows.add("Self-test");
+  } else {
+    // Results stay on screen after the test, and after the link drops.
+    uint8_t r = t.testResults;
+    rows.add((r & TEST_BATTERY_OK) ? "Batt ok" : "Batt FAIL");
+    rows.add("Bat %u.%02uV", t.batteryMv / 1000, (t.batteryMv % 1000) / 10);
+    rows.add(!(r & TEST_GPS_DATA) ? "GPS FAIL" : (r & TEST_GPS_FIX) ? "GPS fix ok" : "GPS no fix");
+    rows.add(!(r & TEST_COMPASS_OK) ? "Cmp absent" : (r & TEST_COMPASS_CAL) ? "Cmp ok cal" : "Cmp no cal");
+    rows.add((r & TEST_RADIO_OK) ? "Radio ok" : "Radio FAIL");
+    rows.add("Boat%4ddB", t.rssi);
+    // Battery drop in mV for: left ahead, left astern, right ahead, right astern.
+    rows.add("Sag mV:");
+    rows.addSag("L fwd", t.testSagMv[0]);
+    rows.addSag("L rev", t.testSagMv[1]);
+    rows.addSag("R fwd", t.testSagMv[2]);
+    rows.addSag("R rev", t.testSagMv[3]);
   }
-
-  // Results stay on screen after the test, and after the link drops.
-  uint8_t r = t.testResults;
-  display.setCursor(0, 18);
-  display.printf("Battery %s %u.%02uV", (r & TEST_BATTERY_OK) ? "ok  " : "FAIL", t.batteryMv / 1000,
-                 (t.batteryMv % 1000) / 10);
-  display.setCursor(0, 27);
-  display.printf("GPS     %s %s", (r & TEST_GPS_DATA) ? "ok  " : "FAIL",
-                 !(r & TEST_GPS_DATA) ? "no data" : (r & TEST_GPS_FIX) ? "fix" : "no fix");
-  display.setCursor(0, 36);
-  display.printf("Compass %s %s", (r & TEST_COMPASS_OK) ? "ok  " : "FAIL",
-                 !(r & TEST_COMPASS_OK) ? "absent" : (r & TEST_COMPASS_CAL) ? "cal" : "no cal");
-  display.setCursor(0, 45);
-  display.printf("Radio   %s %ddBm", (r & TEST_RADIO_OK) ? "ok  " : "FAIL", t.rssi);
-  // Battery drop in mV for: left ahead, left astern, right ahead, right astern.
-  display.setCursor(0, 55);
-  display.printf("mV %u %u %u %u", t.testSagMv[0], t.testSagMv[1], t.testSagMv[2], t.testSagMv[3]);
+  drawRows(rows, top);
 }
 
+// Addresses and radio details are too long for the large font, so this page
+// stays small. It needs no banner, but a recall still takes the top.
 static void drawInfoPage(const Status &st) {
-  drawHeader("INFO", false);
-  display.setCursor(0, 18);
+  uint8_t top = drawBanner(nullptr, false);
+  uint8_t pitch = top ? 9 : 10;
+  display.setCursor(0, top);
   display.print("Me   ");
   display.print(WiFi.macAddress().substring(6));    // last 3 bytes fit the line
-  display.setCursor(0, 28);
+  display.setCursor(0, top + pitch);
   display.printf("Boat %02X:%02X:%02X:%02X", BOAT_MAC[2], BOAT_MAC[3], BOAT_MAC[4], BOAT_MAC[5]);
   // Chip temperature (uncalibrated sensor) and transmit power at each end.
-  display.setCursor(0, 38);
+  display.setCursor(0, top + 2 * pitch);
   display.printf("Me   %3dC tx %2ddBm", (int)linkTempC, linkTxPowerQdbm / 4);
-  display.setCursor(0, 48);
+  display.setCursor(0, top + 3 * pitch);
   if (st.linked) {
     display.printf("Boat %3dC tx %2ddBm", st.t.tempC, st.t.txPowerDbm);
   } else {
     display.print("Boat  --C tx --dBm");
   }
-  display.setCursor(0, 57);
+  display.setCursor(0, top + 4 * pitch);
   display.printf("Ch%d v%d BOOT 2s=update", RADIO_CHANNEL, PROTO_VERSION);
 }
 
@@ -731,18 +814,25 @@ static void drawMessage(const char *line1, const char *line2, const char *line3 
 
 // Call often. A short press is reported on release, a long press as soon as
 // the button has been held for a second.
+static const uint32_t SHORT_PRESS_MAX_MS = 600;   // a tap is shorter than this; a hold counts at 1000
+
 static Press poll(Button &b) {
   bool down = digitalRead(b.pin) == LOW;
   uint32_t now = millis();
   if (down != b.down) {
     if (now - b.changedMs < 40) return PRESS_NONE;   // debounce
+    uint32_t heldMs = now - b.changedMs;
     b.down = down;
     b.changedMs = now;
     if (down) {
       b.longFired = false;
       return PRESS_NONE;
     }
-    return b.longFired ? PRESS_NONE : PRESS_SHORT;
+    // Released after a long press that did fire, or after holding too long to
+    // be a tap but not long enough to count (a hold that was let go early):
+    // neither is a short press, so a hesitant hold never acts as "go back".
+    if (b.longFired || heldMs > SHORT_PRESS_MAX_MS) return PRESS_NONE;
+    return PRESS_SHORT;
   }
   if (down && !b.longFired && now - b.changedMs >= 1000) {
     b.longFired = true;
@@ -929,26 +1019,40 @@ void loop() {
   }
   if (next != PRESS_NONE || select != PRESS_NONE) redraw = true;
 
-  if (page == PAGE_SETUP && setupEditing) {
+  if (!inDetails) {
+    // Top level: NEXT moves down the titles, SELECT opens the highlighted page.
+    if (next == PRESS_SHORT) page = (page + 1) % PAGE_COUNT;
+    else if (select == PRESS_SHORT) { inDetails = true; detailScroll = 0; }
+  } else if (page == PAGE_SETUP && setupEditing) {
     // Editing a setting: NEXT is plus, SELECT is minus; hold SELECT to save, hold NEXT to cancel.
     if (next == PRESS_SHORT) setupStep(+1);
     else if (select == PRESS_SHORT) setupStep(-1);
     else if (select == PRESS_LONG) setupSave(st.linked);
     else if (next == PRESS_LONG) setupEditing = false;
   } else {
-    if (next == PRESS_SHORT) page = (page + 1) % PAGE_COUNT;
-    if (page == PAGE_NAV) {
-      if (select == PRESS_SHORT) {
+    // An open page: a short SELECT goes back to the titles. NEXT scrolls the
+    // rows, except on Nav and Setup where it moves the marker (the view follows
+    // it) and a held SELECT acts.
+    if (select == PRESS_SHORT) {
+      inDetails = false;
+    } else if (page == PAGE_NAV) {
+      if (next == PRESS_SHORT) {
         navMenuIndex = (navMenuIndex + 1) % NAV_MENU_COUNT;
       } else if (select == PRESS_LONG) {
         bool sent = sendNavCommand(st.linked, NAV_MENU_COMMAND[navMenuIndex]);
-        if (sent && NAV_MENU_COMMAND[navMenuIndex] == CMD_SELF_TEST) page = PAGE_TEST;   // watch it run
+        if (sent && NAV_MENU_COMMAND[navMenuIndex] == CMD_SELF_TEST) {   // watch it run
+          page = PAGE_TEST;
+          detailScroll = 0;
+        }
       }
     } else if (page == PAGE_SETUP) {
-      if (select == PRESS_SHORT) setupIndex = (setupIndex + 1) % SETUP_COUNT;
+      if (next == PRESS_SHORT) setupIndex = (setupIndex + 1) % SETUP_COUNT;
       else if (select == PRESS_LONG) setupBeginEdit(st);
-    } else if (select == PRESS_SHORT) {
-      page = (page + PAGE_COUNT - 1) % PAGE_COUNT;
+    } else if (page != PAGE_INFO && next == PRESS_SHORT) {
+      // One row down, back to the top after the last. (drawRows() leaves
+      // detailScroll alone, so first bring it inside what is shown.)
+      uint8_t shown = min<uint8_t>(detailScroll, detailScrollMax);
+      detailScroll = (shown >= detailScrollMax) ? 0 : shown + 1;
     }
   }
 
@@ -967,7 +1071,8 @@ void loop() {
 
   if (displayOk && !consoleDisplayBusy() && (redraw || millis() - drawnMs >= 100)) {
     drawnMs = millis();
-    switch (page) {
+    if (!inDetails) drawTitleList();
+    else switch (page) {
       case PAGE_GPS:  drawGpsPage(st); break;
       case PAGE_NAV:  drawNavPage(st); break;
       case PAGE_SETUP: drawSetupPage(st); break;

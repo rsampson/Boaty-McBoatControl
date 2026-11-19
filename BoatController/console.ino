@@ -66,6 +66,7 @@ static void consoleStatus() {
   Serial.printf("cmd_left=%d\n", cmdLeft);
   Serial.printf("cmd_right=%d\n", cmdRight);
   Serial.printf("page=%u\n", page);
+  Serial.printf("open=%d\n", inDetails);   // 1: the page is open; 0: only its title is highlighted
   Serial.printf("recall=%d\n", recallActive);
   Serial.printf("speed_limit_pct=%u\n", speedLimitPct);
   Serial.printf("battery_mv=%u\n", controllerBatteryMv);
